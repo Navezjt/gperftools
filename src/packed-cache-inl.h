@@ -114,9 +114,7 @@
 
 #include "config.h"
 #include <stddef.h>                     // for size_t
-#ifdef HAVE_STDINT_H
 #include <stdint.h>                     // for uintptr_t
-#endif
 #include "base/basictypes.h"
 #include "common.h"
 #include "internal_logging.h"
@@ -138,7 +136,7 @@ class PackedCache {
  public:
   typedef uintptr_t T;
   typedef uintptr_t K;
-  typedef uint32 V;
+  typedef uint32_t V;
 #ifdef TCMALLOC_SMALL_BUT_SLOW
   // Decrease the size map cache if running in the small memory mode.
   static const int kHashbits = 12;
@@ -150,9 +148,9 @@ class PackedCache {
   static const int kInvalidMask = 0x80;
 
   explicit PackedCache() {
-    COMPILE_ASSERT(kKeybits + kValuebits + 1 <= 8 * sizeof(T), use_whole_keys);
-    COMPILE_ASSERT(kHashbits <= kKeybits, hash_function);
-    COMPILE_ASSERT(kHashbits >= kValuebits + 1, small_values_space);
+    static_assert(kKeybits + kValuebits + 1 <= 8 * sizeof(T));
+    static_assert(kHashbits <= kKeybits);
+    static_assert(kHashbits >= kValuebits + 1);
     Clear();
   }
 

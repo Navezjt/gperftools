@@ -37,16 +37,15 @@
 
 #include <config.h>
 
-#ifdef HAVE_PTHREAD
-#include <pthread.h>
-#endif
 #include <stddef.h>
 #include <set>
 #include "base/stl_allocator.h"
 #include "base/spinlock.h"
+#include "base/threading.h"
 #include "base/thread_annotations.h"
 #include "base/low_level_alloc.h"
 #include "heap-profile-stats.h"
+#include "mmap_hook.h"
 
 // TODO(maxim): add a unittest:
 //  execute a bunch of mmaps and compare memory map what strace logs
@@ -83,10 +82,7 @@ class MemoryRegionMap {
 
   // Every client of MemoryRegionMap must call Init() before first use,
   // and Shutdown() after last use.  This allows us to reference count
-  // this (singleton) class properly.  MemoryRegionMap assumes it's the
-  // only client of MallocHooks, so a client can only register other
-  // MallocHooks after calling Init() and must unregister them before
-  // calling Shutdown().
+  // this (singleton) class properly.
 
   // Initialize this module to record memory allocation stack traces.
   // Stack traces that have more than "max_stack_depth" frames
@@ -123,15 +119,15 @@ class MemoryRegionMap {
 
   // Locker object that acquires the MemoryRegionMap::Lock
   // for the duration of its lifetime (a C++ scope).
-  class LockHolder {
+  class SCOPED_LOCKABLE LockHolder {
    public:
-    LockHolder() { Lock(); }
-    ~LockHolder() { Unlock(); }
+     LockHolder() EXCLUSIVE_LOCK_FUNCTION(lock_) { Lock(); }
+     ~LockHolder() UNLOCK_FUNCTION(lock_) { Unlock(); }
    private:
     DISALLOW_COPY_AND_ASSIGN(LockHolder);
   };
 
-  // A memory region that we know about through malloc_hook-s.
+  // A memory region that we know about through mmap hooks.
   // This is essentially an interface through which MemoryRegionMap
   // exports the collected data to its clients.  Thread-compatible.
   struct Region {
@@ -229,15 +225,14 @@ class MemoryRegionMap {
 
   // Iterate over the buckets which store mmap and munmap counts per stack
   // trace.  It calls "callback" for each bucket, and passes "arg" to it.
-  template<class Type>
-  static void IterateBuckets(void (*callback)(const HeapProfileBucket*, Type),
-                             Type arg);
+  template<class Body>
+  static void IterateBuckets(Body body) EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
   // Get the bucket whose caller stack trace is "key".  The stack trace is
   // used to a depth of "depth" at most.  The requested bucket is created if
   // needed.
   // The bucket table is described in heap-profile-stats.h.
-  static HeapProfileBucket* GetBucket(int depth, const void* const key[]);
+  static HeapProfileBucket* GetBucket(int depth, const void* const key[]) EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
  private:  // our internal types ==============================================
 
@@ -278,8 +273,8 @@ class MemoryRegionMap {
   static RegionIterator EndRegionLocked();
 
   // Return the accumulated sizes of mapped and unmapped regions.
-  static int64 MapSize() { return map_size_; }
-  static int64 UnmapSize() { return unmap_size_; }
+  static int64_t MapSize() { return map_size_; }
+  static int64_t UnmapSize() { return unmap_size_; }
 
   // Effectively private type from our .cc =================================
   // public to let us declare global objects:
@@ -313,12 +308,12 @@ class MemoryRegionMap {
   // Recursion count for the recursive lock.
   static int recursion_count_;
   // The thread id of the thread that's inside the recursive lock.
-  static pthread_t lock_owner_tid_;
+  static std::thread::id lock_owner_tid_;
 
   // Total size of all mapped pages so far
-  static int64 map_size_;
+  static int64_t map_size_;
   // Total size of all unmapped pages so far
-  static int64 unmap_size_;
+  static int64_t unmap_size_;
 
   // Bucket hash table which is described in heap-profile-stats.h.
   static HeapProfileBucket** bucket_table_ GUARDED_BY(lock_);
@@ -344,6 +339,8 @@ class MemoryRegionMap {
 
   static const void* saved_buckets_keys_[20][kMaxStackDepth] GUARDED_BY(lock_);
 
+  static tcmalloc::MappingHookSpace mapping_hook_space_;
+
   // helpers ==================================================================
 
   // Helper for FindRegion and FindAndMarkStackRegion:
@@ -360,7 +357,7 @@ class MemoryRegionMap {
 
   // Restore buckets saved in a tmp static array by GetBucket to the bucket
   // table where all buckets eventually should be.
-  static void RestoreSavedBucketsLocked();
+  static void RestoreSavedBucketsLocked() EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
   // Initialize RegionSet regions_.
   inline static void InitRegionSetLocked();
@@ -370,10 +367,10 @@ class MemoryRegionMap {
   inline static void InsertRegionLocked(const Region& region);
 
   // Record addition of a memory region at address "start" of size "size"
-  // (called from our mmap/mremap/sbrk hooks).
+  // (called from our mmap/mremap/sbrk hook).
   static void RecordRegionAddition(const void* start, size_t size);
   // Record deletion of a memory region at address "start" of size "size"
-  // (called from our munmap/mremap/sbrk hooks).
+  // (called from our munmap/mremap/sbrk hook).
   static void RecordRegionRemoval(const void* start, size_t size);
 
   // Record deletion of a memory region of size "size" in a bucket whose
@@ -381,18 +378,9 @@ class MemoryRegionMap {
   // "depth" at most.
   static void RecordRegionRemovalInBucket(int depth,
                                           const void* const key[],
-                                          size_t size);
+                                          size_t size) EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
-  // Hooks for MallocHook
-  static void MmapHook(const void* result,
-                       const void* start, size_t size,
-                       int prot, int flags,
-                       int fd, off_t offset);
-  static void MunmapHook(const void* ptr, size_t size);
-  static void MremapHook(const void* result, const void* old_addr,
-                         size_t old_size, size_t new_size, int flags,
-                         const void* new_addr);
-  static void SbrkHook(const void* result, ptrdiff_t increment);
+  static void HandleMappingEvent(const tcmalloc::MappingEvent& evt);
 
   // Log all memory regions; Useful for debugging only.
   // Assumes Lock() is held
@@ -401,14 +389,13 @@ class MemoryRegionMap {
   DISALLOW_COPY_AND_ASSIGN(MemoryRegionMap);
 };
 
-template <class Type>
-void MemoryRegionMap::IterateBuckets(
-    void (*callback)(const HeapProfileBucket*, Type), Type callback_arg) {
+template <class Body>
+void MemoryRegionMap::IterateBuckets(Body body) {
   for (int index = 0; index < kHashTableSize; index++) {
     for (HeapProfileBucket* bucket = bucket_table_[index];
          bucket != NULL;
          bucket = bucket->next) {
-      callback(bucket, callback_arg);
+      body(bucket);
     }
   }
 }

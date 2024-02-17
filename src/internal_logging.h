@@ -38,13 +38,7 @@
 
 #include <config.h>
 #include <stddef.h>                     // for size_t
-#if defined HAVE_STDINT_H
 #include <stdint.h>
-#elif defined HAVE_INTTYPES_H
-#include <inttypes.h>
-#else
-#include <sys/types.h>
-#endif
 
 //-------------------------------------------------------------------
 // Utility routines
@@ -61,7 +55,6 @@ namespace tcmalloc {
 enum LogMode {
   kLog,                       // Just print the message
   kCrash,                     // Print the message and crash
-  kCrashWithStats             // Print the message, some stats, and crash
 };
 
 class Logger;
@@ -100,9 +93,6 @@ extern PERFTOOLS_DLL_DECL void Log(LogMode mode, const char* filename, int line,
                 LogItem a, LogItem b = LogItem(),
                 LogItem c = LogItem(), LogItem d = LogItem());
 
-// Tests can override this function to collect logging messages.
-extern PERFTOOLS_DLL_DECL void (*log_message_writer)(const char* msg, int length);
-
 }  // end tcmalloc namespace
 
 // Like assert(), but executed even in NDEBUG mode
@@ -111,15 +101,25 @@ extern PERFTOOLS_DLL_DECL void (*log_message_writer)(const char* msg, int length
 do {                                                                     \
   if (!(cond)) {                                                         \
     ::tcmalloc::Log(::tcmalloc::kCrash, __FILE__, __LINE__, #cond);      \
+    for (;;) {} /* unreachable */                                        \
   }                                                                      \
 } while (0)
+
+#define CHECK_CONDITION_PRINT(cond, str)                            \
+  do {                                                              \
+    if (!(cond)) {                                                  \
+      ::tcmalloc::Log(::tcmalloc::kCrash, __FILE__, __LINE__, str); \
+    }                                                               \
+  } while (0)
 
 // Our own version of assert() so we can avoid hanging by trying to do
 // all kinds of goofy printing while holding the malloc lock.
 #ifndef NDEBUG
 #define ASSERT(cond) CHECK_CONDITION(cond)
+#define ASSERT_PRINT(cond, str) CHECK_CONDITION_PRINT(cond, str)
 #else
 #define ASSERT(cond) ((void) 0)
+#define ASSERT_PRINT(cond, str) ((void)0)
 #endif
 
 // Print into buffer

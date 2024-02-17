@@ -102,16 +102,11 @@
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
-#ifdef HAVE_INTTYPES_H
 #include <inttypes.h>
-#endif
 #ifdef HAVE_MMAP
 #include <sys/mman.h>
 #elif !defined(MAP_FAILED)
 #define MAP_FAILED -1  // the only thing we need from mman.h
-#endif
-#ifdef HAVE_PTHREAD
-#include <pthread.h>   // for pthread_t, pthread_self()
 #endif
 #include <stddef.h>
 
@@ -123,17 +118,11 @@
 #include "base/googleinit.h"
 #include "base/logging.h"
 #include "base/low_level_alloc.h"
-#include "malloc_hook-inl.h"
+#include "base/threading.h"
+#include "mmap_hook.h"
 
 #include <gperftools/stacktrace.h>
-#include <gperftools/malloc_hook.h>
-
-// MREMAP_FIXED is a linux extension.  How it's used in this file,
-// setting it to 0 is equivalent to saying, "This feature isn't
-// supported", which is right.
-#ifndef MREMAP_FIXED
-# define MREMAP_FIXED  0
-#endif
+#include <gperftools/malloc_hook.h> // For MallocHook::GetCallerStackTrace
 
 using std::max;
 
@@ -141,36 +130,35 @@ using std::max;
 
 int MemoryRegionMap::client_count_ = 0;
 int MemoryRegionMap::max_stack_depth_ = 0;
-MemoryRegionMap::RegionSet* MemoryRegionMap::regions_ = NULL;
-LowLevelAlloc::Arena* MemoryRegionMap::arena_ = NULL;
-SpinLock MemoryRegionMap::lock_(SpinLock::LINKER_INITIALIZED);
-SpinLock MemoryRegionMap::owner_lock_(  // ACQUIRED_AFTER(lock_)
-    SpinLock::LINKER_INITIALIZED);
+MemoryRegionMap::RegionSet* MemoryRegionMap::regions_ = nullptr;
+LowLevelAlloc::Arena* MemoryRegionMap::arena_ = nullptr;
+SpinLock MemoryRegionMap::lock_;
+SpinLock MemoryRegionMap::owner_lock_;  // ACQUIRED_AFTER(lock_)
 int MemoryRegionMap::recursion_count_ = 0;  // GUARDED_BY(owner_lock_)
-pthread_t MemoryRegionMap::lock_owner_tid_;  // GUARDED_BY(owner_lock_)
-int64 MemoryRegionMap::map_size_ = 0;
-int64 MemoryRegionMap::unmap_size_ = 0;
-HeapProfileBucket** MemoryRegionMap::bucket_table_ = NULL;  // GUARDED_BY(lock_)
+std::thread::id MemoryRegionMap::lock_owner_tid_;  // GUARDED_BY(owner_lock_)
+int64_t MemoryRegionMap::map_size_ = 0;
+int64_t MemoryRegionMap::unmap_size_ = 0;
+HeapProfileBucket** MemoryRegionMap::bucket_table_ = nullptr;  // GUARDED_BY(lock_)
 int MemoryRegionMap::num_buckets_ = 0;  // GUARDED_BY(lock_)
 int MemoryRegionMap::saved_buckets_count_ = 0;  // GUARDED_BY(lock_)
 HeapProfileBucket MemoryRegionMap::saved_buckets_[20];  // GUARDED_BY(lock_)
-
 // GUARDED_BY(lock_)
 const void* MemoryRegionMap::saved_buckets_keys_[20][kMaxStackDepth];
+tcmalloc::MappingHookSpace MemoryRegionMap::mapping_hook_space_;
 
 // ========================================================================= //
 
 // Simple hook into execution of global object constructors,
-// so that we do not call pthread_self() when it does not yet work.
+// so that we do not call std::this_thread::get_id() when it does not yet work.
 static bool libpthread_initialized = false;
 REGISTER_MODULE_INITIALIZER(libpthread_initialized_setter,
                             libpthread_initialized = true);
 
-static inline bool current_thread_is(pthread_t should_be) {
+static inline bool current_thread_is(std::thread::id should_be) {
   // Before main() runs, there's only one thread, so we're always that thread
   if (!libpthread_initialized) return true;
   // this starts working only sometime well into global constructor execution:
-  return pthread_equal(pthread_self(), should_be);
+  return std::this_thread::get_id() == should_be;
 }
 
 // ========================================================================= //
@@ -193,7 +181,7 @@ static MemoryRegionMap::RegionSetRep regions_rep;
 // (or rather should we *not* use regions_ to record a hooked mmap).
 static bool recursive_insert = false;
 
-void MemoryRegionMap::Init(int max_stack_depth, bool use_buckets) {
+void MemoryRegionMap::Init(int max_stack_depth, bool use_buckets) NO_THREAD_SAFETY_ANALYSIS {
   RAW_VLOG(10, "MemoryRegionMap Init");
   RAW_CHECK(max_stack_depth >= 0, "");
   // Make sure we don't overflow the memory in region stacks:
@@ -208,11 +196,10 @@ void MemoryRegionMap::Init(int max_stack_depth, bool use_buckets) {
     RAW_VLOG(10, "MemoryRegionMap Init increment done");
     return;
   }
+
   // Set our hooks and make sure they were installed:
-  RAW_CHECK(MallocHook::AddMmapHook(&MmapHook), "");
-  RAW_CHECK(MallocHook::AddMremapHook(&MremapHook), "");
-  RAW_CHECK(MallocHook::AddSbrkHook(&SbrkHook), "");
-  RAW_CHECK(MallocHook::AddMunmapHook(&MunmapHook), "");
+  tcmalloc::HookMMapEvents(&mapping_hook_space_, HandleMappingEvent);
+
   // We need to set recursive_insert since the NewArena call itself
   // will already do some allocations with mmap which our hooks will catch
   // recursive_insert allows us to buffer info about these mmap calls.
@@ -241,7 +228,7 @@ void MemoryRegionMap::Init(int max_stack_depth, bool use_buckets) {
   RAW_VLOG(10, "MemoryRegionMap Init done");
 }
 
-bool MemoryRegionMap::Shutdown() {
+bool MemoryRegionMap::Shutdown() NO_THREAD_SAFETY_ANALYSIS {
   RAW_VLOG(10, "MemoryRegionMap Shutdown");
   Lock();
   RAW_CHECK(client_count_ > 0, "");
@@ -264,10 +251,9 @@ bool MemoryRegionMap::Shutdown() {
     num_buckets_ = 0;
     bucket_table_ = NULL;
   }
-  RAW_CHECK(MallocHook::RemoveMmapHook(&MmapHook), "");
-  RAW_CHECK(MallocHook::RemoveMremapHook(&MremapHook), "");
-  RAW_CHECK(MallocHook::RemoveSbrkHook(&SbrkHook), "");
-  RAW_CHECK(MallocHook::RemoveMunmapHook(&MunmapHook), "");
+
+  tcmalloc::UnHookMMapEvents(&mapping_hook_space_);
+
   if (regions_) regions_->~RegionSet();
   regions_ = NULL;
   bool deleted_arena = LowLevelAlloc::DeleteArena(arena_);
@@ -294,9 +280,9 @@ bool MemoryRegionMap::IsRecordingLocked() {
 //     both lock_ and owner_lock_ are held. They may be read under
 //     just owner_lock_.
 //   * At entry and exit of Lock() and Unlock(), the current thread
-//     owns lock_ iff pthread_equal(lock_owner_tid_, pthread_self())
+//     owns lock_ iff lock_owner_tid_ == std::this_thread::get_id()
 //     && recursion_count_ > 0.
-void MemoryRegionMap::Lock() {
+void MemoryRegionMap::Lock() NO_THREAD_SAFETY_ANALYSIS {
   {
     SpinLockHolder l(&owner_lock_);
     if (recursion_count_ > 0 && current_thread_is(lock_owner_tid_)) {
@@ -313,12 +299,12 @@ void MemoryRegionMap::Lock() {
     RAW_CHECK(recursion_count_ == 0,
               "Last Unlock didn't reset recursion_count_");
     if (libpthread_initialized)
-      lock_owner_tid_ = pthread_self();
+      lock_owner_tid_ = std::this_thread::get_id();
     recursion_count_ = 1;
   }
 }
 
-void MemoryRegionMap::Unlock() {
+void MemoryRegionMap::Unlock() NO_THREAD_SAFETY_ANALYSIS {
   SpinLockHolder l(&owner_lock_);
   RAW_CHECK(recursion_count_ >  0, "unlock when not held");
   RAW_CHECK(lock_.IsHeld(),
@@ -768,56 +754,17 @@ void MemoryRegionMap::RecordRegionRemovalInBucket(int depth,
   b->free_size += size;
 }
 
-void MemoryRegionMap::MmapHook(const void* result,
-                               const void* start, size_t size,
-                               int prot, int flags,
-                               int fd, off_t offset) {
-  // TODO(maxim): replace all 0x%" PRIxPTR " by %p when RAW_VLOG uses a safe
-  // snprintf reimplementation that does not malloc to pretty-print NULL
-  RAW_VLOG(10, "MMap = 0x%" PRIxPTR " of %zu at %" PRIu64 " "
-              "prot %d flags %d fd %d offs %" PRId64,
-              reinterpret_cast<uintptr_t>(result), size,
-              reinterpret_cast<uint64>(start), prot, flags, fd,
-              static_cast<int64>(offset));
-  if (result != reinterpret_cast<void*>(MAP_FAILED)  &&  size != 0) {
-    RecordRegionAddition(result, size);
+void MemoryRegionMap::HandleMappingEvent(const tcmalloc::MappingEvent& evt) {
+  RAW_VLOG(10, "MMap: before: %p, +%zu; after: %p, +%zu; fd: %d, off: %lld, sbrk: %s",
+           evt.before_address, evt.before_valid ? evt.before_length : 0,
+           evt.after_address, evt.after_valid ? evt.after_length : 0,
+           evt.file_valid ? evt.file_fd : -1, evt.file_valid ? (long long)evt.file_off : 0LL,
+           evt.is_sbrk ? "true" : "false");
+  if (evt.before_valid && evt.before_length != 0) {
+    RecordRegionRemoval(evt.before_address, evt.before_length);
   }
-}
-
-void MemoryRegionMap::MunmapHook(const void* ptr, size_t size) {
-  RAW_VLOG(10, "MUnmap of %p %zu", ptr, size);
-  if (size != 0) {
-    RecordRegionRemoval(ptr, size);
-  }
-}
-
-void MemoryRegionMap::MremapHook(const void* result,
-                                 const void* old_addr, size_t old_size,
-                                 size_t new_size, int flags,
-                                 const void* new_addr) {
-  RAW_VLOG(10, "MRemap = 0x%" PRIxPTR " of 0x%" PRIxPTR " %zu "
-              "to %zu flags %d new_addr=0x%" PRIxPTR,
-              (uintptr_t)result, (uintptr_t)old_addr,
-               old_size, new_size, flags,
-               flags & MREMAP_FIXED ? (uintptr_t)new_addr : 0);
-  if (result != reinterpret_cast<void*>(-1)) {
-    RecordRegionRemoval(old_addr, old_size);
-    RecordRegionAddition(result, new_size);
-  }
-}
-
-void MemoryRegionMap::SbrkHook(const void* result, ptrdiff_t increment) {
-  RAW_VLOG(10, "Sbrk = 0x%" PRIxPTR " of %zd", (uintptr_t)result, increment);
-  if (result != reinterpret_cast<void*>(-1)) {
-    if (increment > 0) {
-      void* new_end = sbrk(0);
-      RecordRegionAddition(result, reinterpret_cast<uintptr_t>(new_end) -
-                                   reinterpret_cast<uintptr_t>(result));
-    } else if (increment < 0) {
-      void* new_end = sbrk(0);
-      RecordRegionRemoval(new_end, reinterpret_cast<uintptr_t>(result) -
-                                   reinterpret_cast<uintptr_t>(new_end));
-    }
+  if (evt.after_valid && evt.after_length != 0) {
+    RecordRegionAddition(evt.after_address, evt.after_length);
   }
 }
 

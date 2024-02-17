@@ -35,44 +35,28 @@
 #include <assert.h>
 #include <string.h>
 #include <stdio.h>
-#if defined HAVE_STDINT_H
 #include <stdint.h>
-#elif defined HAVE_INTTYPES_H
-#include <inttypes.h>
-#else
-#include <sys/types.h>
-#endif
 #include <string>
+
+#include <algorithm>
+
 #include "base/dynamic_annotations.h"
-#include "base/sysinfo.h"    // for FillProcSelfMaps
+#include "base/googleinit.h"
+#include "base/proc_maps_iterator.h"
+#include "gperftools/malloc_extension.h"
+#include "gperftools/malloc_extension_c.h"
+
 #ifndef NO_HEAP_CHECK
 #include "gperftools/heap-checker.h"
 #endif
-#include "gperftools/malloc_extension.h"
-#include "gperftools/malloc_extension_c.h"
-#include "maybe_threads.h"
-#include "base/googleinit.h"
 
 using std::string;
 using std::vector;
 
 static void DumpAddressMap(string* result) {
-  *result += "\nMAPPED_LIBRARIES:\n";
-  // We keep doubling until we get a fit
-  const size_t old_resultlen = result->size();
-  for (int amap_size = 10240; amap_size < 10000000; amap_size *= 2) {
-    result->resize(old_resultlen + amap_size);
-    bool wrote_all = false;
-    const int bytes_written =
-        tcmalloc::FillProcSelfMaps(&((*result)[old_resultlen]), amap_size,
-                                   &wrote_all);
-    if (wrote_all) {   // we fit!
-      (*result)[old_resultlen + bytes_written] = '\0';
-      result->resize(old_resultlen + bytes_written);
-      return;
-    }
-  }
-  result->reserve(old_resultlen);   // just don't print anything
+  tcmalloc::StringGenericWriter writer(result);
+  writer.AppendStr("\nMAPPED_LIBRARIES:\n");
+  tcmalloc::SaveProcSelfMaps(&writer);
 }
 
 // Note: this routine is meant to be called before threads are spawned.
@@ -205,11 +189,16 @@ void MallocExtension::MarkThreadTemporarilyIdle() {
 
 static MallocExtension* current_instance;
 
+static union {
+  char chars[sizeof(MallocExtension)];
+  void *ptr;
+} mallocextension_implementation_space;
+
 static void InitModule() {
   if (current_instance != NULL) {
     return;
   }
-  current_instance = new MallocExtension;
+  current_instance = new (mallocextension_implementation_space.chars) MallocExtension();
 #ifndef NO_HEAP_CHECK
   HeapLeakChecker::IgnoreObject(current_instance);
 #endif
@@ -259,10 +248,10 @@ void PrintCountAndSize(MallocExtensionWriter* writer,
   char buf[100];
   snprintf(buf, sizeof(buf),
            "%6" PRIu64 ": %8" PRIu64 " [%6" PRIu64 ": %8" PRIu64 "] @",
-           static_cast<uint64>(count),
-           static_cast<uint64>(size),
-           static_cast<uint64>(count),
-           static_cast<uint64>(size));
+           static_cast<uint64_t>(count),
+           static_cast<uint64_t>(size),
+           static_cast<uint64_t>(count),
+           static_cast<uint64_t>(size));
   writer->append(buf, strlen(buf));
 }
 
@@ -375,6 +364,8 @@ C_SHIM(MarkThreadIdle, void, (void), ());
 C_SHIM(MarkThreadBusy, void, (void), ());
 C_SHIM(ReleaseFreeMemory, void, (void), ());
 C_SHIM(ReleaseToSystem, void, (size_t num_bytes), (num_bytes));
+C_SHIM(SetMemoryReleaseRate, void, (double rate), (rate));
+C_SHIM(GetMemoryReleaseRate, double, (void), ());
 C_SHIM(GetEstimatedAllocatedSize, size_t, (size_t size), (size));
 C_SHIM(GetAllocatedSize, size_t, (const void* p), (p));
 C_SHIM(GetThreadCacheSize, size_t, (void), ());

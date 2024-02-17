@@ -50,13 +50,9 @@
 
 #include <stddef.h>                     // for NULL, size_t
 #include <string.h>                     // for memset
-#if defined HAVE_STDINT_H
 #include <stdint.h>
-#elif defined HAVE_INTTYPES_H
-#include <inttypes.h>
-#else
-#include <sys/types.h>
-#endif
+
+#include "base/basictypes.h"
 #include "internal_logging.h"  // for ASSERT
 
 // Single-level array
@@ -89,7 +85,7 @@ class TCMalloc_PageMap1 {
 
   // Return the current value for KEY.  Returns NULL if not yet set,
   // or if k is out of range.
-  ATTRIBUTE_ALWAYS_INLINE
+  ALWAYS_INLINE
   void* get(Number k) const {
     if ((k >> BITS) > 0) {
       return NULL;
@@ -142,7 +138,7 @@ class TCMalloc_PageMap2 {
     memset(root_, 0, sizeof(root_));
   }
 
-  ATTRIBUTE_ALWAYS_INLINE
+  ALWAYS_INLINE
   void* get(Number k) const {
     const Number i1 = k >> LEAF_BITS;
     const Number i2 = k & (LEAF_LENGTH-1);
@@ -248,7 +244,7 @@ class TCMalloc_PageMap3 {
     memset(&root_, 0, sizeof(root_));
   }
 
-  ATTRIBUTE_ALWAYS_INLINE
+  ALWAYS_INLINE
   void* get(Number k) const {
     const Number i1 = k >> (LEAF_BITS + INTERIOR_BITS);
     const Number i2 = (k >> LEAF_BITS) & (INTERIOR_LENGTH-1);

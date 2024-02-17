@@ -113,31 +113,31 @@ size_t mz_size(malloc_zone_t* zone, const void* ptr) {
   return MallocExtension::instance()->GetAllocatedSize(const_cast<void*>(ptr));
 }
 
-void* mz_malloc(malloc_zone_t* zone, size_t size) {
+ATTRIBUTE_SECTION(google_malloc) void* mz_malloc(malloc_zone_t* zone, size_t size) {
   return tc_malloc(size);
 }
 
-void* mz_calloc(malloc_zone_t* zone, size_t num_items, size_t size) {
+ATTRIBUTE_SECTION(google_malloc) void* mz_calloc(malloc_zone_t* zone, size_t num_items, size_t size) {
   return tc_calloc(num_items, size);
 }
 
-void* mz_valloc(malloc_zone_t* zone, size_t size) {
+ATTRIBUTE_SECTION(google_malloc) void* mz_valloc(malloc_zone_t* zone, size_t size) {
   return tc_valloc(size);
 }
 
-void mz_free(malloc_zone_t* zone, void* ptr) {
+ATTRIBUTE_SECTION(google_malloc) void mz_free(malloc_zone_t* zone, void* ptr) {
   return tc_free(ptr);
 }
 
-void mz_free_definite_size(malloc_zone_t* zone, void *ptr, size_t size) {
+ATTRIBUTE_SECTION(google_malloc) void mz_free_definite_size(malloc_zone_t* zone, void *ptr, size_t size) {
   return tc_free(ptr);
 }
 
-void* mz_realloc(malloc_zone_t* zone, void* ptr, size_t size) {
+ATTRIBUTE_SECTION(google_malloc) void* mz_realloc(malloc_zone_t* zone, void* ptr, size_t size) {
   return tc_realloc(ptr, size);
 }
 
-void* mz_memalign(malloc_zone_t* zone, size_t align, size_t size) {
+ATTRIBUTE_SECTION(google_malloc) void* mz_memalign(malloc_zone_t* zone, size_t align, size_t size) {
   return tc_memalign(align, size);
 }
 
@@ -276,9 +276,11 @@ static void ReplaceSystemAlloc() {
     MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_6
   // Switch to version 6 on OSX 10.6 to support memalign.
   tcmalloc_zone.version = 6;
-  tcmalloc_zone.free_definite_size = &mz_free_definite_size;
   tcmalloc_zone.memalign = &mz_memalign;
+#ifndef __POWERPC__
+  tcmalloc_zone.free_definite_size = &mz_free_definite_size;
   tcmalloc_introspection.zone_locked = &mi_zone_locked;
+#endif
 
   // Request the default purgable zone to force its creation. The
   // current default zone is registered with the purgable zone for

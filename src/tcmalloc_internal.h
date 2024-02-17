@@ -1,5 +1,5 @@
 // -*- Mode: C++; c-basic-offset: 2; indent-tabs-mode: nil -*-
-// Copyright (c) 2014, gperftools Contributors
+// Copyright (c) 2007, Google Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -28,58 +28,43 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef EMERGENCY_MALLOC_H
-#define EMERGENCY_MALLOC_H
-#include "config.h"
+// ---
+// Author: Craig Silverstein <opensource@google.com>
+//
+// Some obscure memory-allocation routines may not be declared on all
+// systems.  In those cases, we'll just declare them ourselves.
+// This file is meant to be used only internally, for unittests.
 
-#include <stddef.h>
+#include <config.h>
 
-#include "base/basictypes.h"
-#include "common.h"
-#include "thread_cache_ptr.h"
+#ifndef _XOPEN_SOURCE
+# define _XOPEN_SOURCE 600  // for posix_memalign
+#endif
+#include <stdlib.h>         // for posix_memalign
+// FreeBSD has malloc.h, but complains if you use it
+#if defined(HAVE_MALLOC_H) && !defined(__FreeBSD__)
+#include <malloc.h>         // for memalign, valloc, pvalloc
+#endif
 
-namespace tcmalloc {
+// __THROW is defined in glibc systems.  It means, counter-intuitively,
+// "This function will never throw an exception."  It's an optional
+// optimization tool, but we may need to use it to match glibc prototypes.
+#ifndef __THROW    // I guess we're not on a glibc system
+# define __THROW   // __THROW is just an optimization, so ok to make it ""
+#endif
 
-static constexpr uintptr_t kEmergencyArenaShift = 20+4; // 16 megs
-static constexpr uintptr_t kEmergencyArenaSize = uintptr_t{1} << kEmergencyArenaShift;
-
-ATTRIBUTE_HIDDEN extern char *emergency_arena_start;
-ATTRIBUTE_HIDDEN extern uintptr_t emergency_arena_start_shifted;;
-
-ATTRIBUTE_HIDDEN void *EmergencyMalloc(size_t size);
-ATTRIBUTE_HIDDEN void EmergencyFree(void *p);
-ATTRIBUTE_HIDDEN void *EmergencyCalloc(size_t n, size_t elem_size);
-ATTRIBUTE_HIDDEN void *EmergencyRealloc(void *old_ptr, size_t new_size);
-
-static inline bool IsEmergencyPtr(const void *_ptr) {
-  uintptr_t ptr = reinterpret_cast<uintptr_t>(_ptr);
-  return PREDICT_FALSE((ptr >> kEmergencyArenaShift) == emergency_arena_start_shifted)
-    && emergency_arena_start_shifted;
-}
-
-class StacktraceScope {
-public:
-  StacktraceScope() : stacktrace_allowed_(EnterStacktraceScope()) { }
-  bool IsStacktraceAllowed() {
-    return stacktrace_allowed_;
-  }
-  ~StacktraceScope() {
-    if (stacktrace_allowed_) {
-      tcmalloc::ResetUseEmergencyMalloc();
-    }
-  }
-private:
-  static bool EnterStacktraceScope() {
-    if (tcmalloc::IsUseEmergencyMalloc()) {
-      return false;
-    }
-    tcmalloc::SetUseEmergencyMalloc();
-    return true;
-  }
-
-  const bool stacktrace_allowed_;
-};
-
-} // namespace tcmalloc
-
+#if !HAVE_DECL_CFREE
+extern "C" void cfree(void* ptr) __THROW;
+#endif
+#if !HAVE_DECL_POSIX_MEMALIGN
+extern "C" int posix_memalign(void** ptr, size_t align, size_t size) __THROW;
+#endif
+#if !HAVE_DECL_MEMALIGN
+extern "C" void* memalign(size_t __alignment, size_t __size) __THROW;
+#endif
+#if !HAVE_DECL_VALLOC
+extern "C" void* valloc(size_t __size) __THROW;
+#endif
+#if !HAVE_DECL_PVALLOC
+extern "C" void* pvalloc(size_t __size) __THROW;
 #endif

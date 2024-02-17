@@ -36,11 +36,9 @@
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
 #endif
-#ifdef HAVE_INTTYPES_H
 #include <inttypes.h>
-#endif
-// We only need malloc.h for struct mallinfo.
-#ifdef HAVE_STRUCT_MALLINFO
+// We only need malloc.h for structs mallinfo and mallinfo2.
+#if defined(HAVE_STRUCT_MALLINFO) || defined(HAVE_STRUCT_MALLINFO2)
 // Malloc can be in several places on older versions of OS X.
 # if defined(HAVE_MALLOC_H)
 # include <malloc.h>
@@ -49,9 +47,6 @@
 # elif defined(HAVE_SYS_MALLOC_H)
 # include <sys/malloc.h>
 # endif
-#endif
-#ifdef HAVE_PTHREAD
-#include <pthread.h>
 #endif
 #include <stdarg.h>
 #include <stdio.h>
@@ -67,13 +62,19 @@
 
 #include <gperftools/malloc_extension.h>
 #include <gperftools/malloc_hook.h>
-#include <gperftools/stacktrace.h>
+
+// Will be pulled in as along with tcmalloc.cc
+// #include <gperftools/tcmalloc.h>
+
 #include "addressmap-inl.h"
 #include "base/commandlineflags.h"
 #include "base/googleinit.h"
 #include "base/logging.h"
 #include "base/spinlock.h"
+#include "base/threading.h"
 #include "malloc_hook-inl.h"
+#include "maybe_emergency_malloc.h"
+#include "safe_strerror.h"
 #include "symbolize.h"
 
 // NOTE: due to #define below, tcmalloc.cc will omit tc_XXX
@@ -134,13 +135,6 @@ DEFINE_int32(max_free_queue_size,
 DEFINE_bool(symbolize_stacktrace,
             EnvToBool("TCMALLOC_SYMBOLIZE_STACKTRACE", true),
             "Symbolize the stack trace when provided (on some error exits)");
-
-// If we are LD_PRELOAD-ed against a non-pthreads app, then
-// pthread_once won't be defined.  We declare it here, for that
-// case (with weak linkage) which will cause the non-definition to
-// resolve to NULL.  We can then check for NULL or not in Instance.
-extern "C" int pthread_once(pthread_once_t *, void (*)(void))
-    ATTRIBUTE_WEAK;
 
 // ========================================================================= //
 
@@ -203,7 +197,7 @@ class FreeQueue {
 
 struct MallocBlockQueueEntry {
   MallocBlockQueueEntry() : block(NULL), size(0),
-                            num_deleter_pcs(0), deleter_threadid(0) {}
+                            num_deleter_pcs(0) {}
   MallocBlockQueueEntry(MallocBlock* b, size_t s) : block(b), size(s) {
     if (FLAGS_max_free_queue_size != 0 && b != NULL) {
       // Adjust the number of frames to skip (4) if you change the
@@ -213,12 +207,9 @@ struct MallocBlockQueueEntry {
           deleter_pcs,
           sizeof(deleter_pcs) / sizeof(deleter_pcs[0]),
           4);
-      deleter_threadid = pthread_self();
+      deleter_threadid = std::this_thread::get_id();
     } else {
       num_deleter_pcs = 0;
-      // Zero is an illegal pthread id by my reading of the pthread
-      // implementation:
-      deleter_threadid = 0;
     }
   }
 
@@ -231,7 +222,7 @@ struct MallocBlockQueueEntry {
   // overhead under the LP64 data model.)
   void* deleter_pcs[16];
   int num_deleter_pcs;
-  pthread_t deleter_threadid;
+  std::thread::id deleter_threadid;
 };
 
 class MallocBlock {
@@ -281,8 +272,7 @@ class MallocBlock {
 
   // This array will be filled with 0xCD, for use with memcmp.
   static unsigned char kMagicDeletedBuffer[1024];
-  static pthread_once_t deleted_buffer_initialized_;
-  static bool deleted_buffer_initialized_no_pthreads_;
+  static tcmalloc::TrivialOnce deleted_buffer_initialized_;
 
  private:  // data layout
 
@@ -302,8 +292,7 @@ class MallocBlock {
   // ...
   // then come the size2_ and magic2_, or a full page of mprotect-ed memory
   // if the malloc_page_fence feature is enabled.
-  size_t size2_;
-  size_t magic2_;
+  size_t size_and_magic2_[2];
 
  private:  // static data and helpers
 
@@ -311,23 +300,23 @@ class MallocBlock {
   // or the type or'ed with kDeallocatedTypeBit
   // for each formerly allocated object.
   typedef AddressMap<int> AllocMap;
-  static AllocMap* alloc_map_;
+  static inline AllocMap* alloc_map_;
   // This protects alloc_map_ and consistent state of metadata
   // for each still-allocated object in it.
   // We use spin locks instead of pthread_mutex_t locks
   // to prevent crashes via calls to pthread_mutex_(un)lock
   // for the (de)allocations coming from pthreads initialization itself.
-  static SpinLock alloc_map_lock_;
+  static inline SpinLock alloc_map_lock_;
 
   // A queue of freed blocks.  Instead of releasing blocks to the allocator
   // immediately, we put them in a queue, freeing them only when necessary
   // to keep the total size of all the freed blocks below the limit set by
   // FLAGS_max_free_queue_size.
-  static FreeQueue<MallocBlockQueueEntry>* free_queue_;
+  static inline FreeQueue<MallocBlockQueueEntry>* free_queue_;
 
-  static size_t free_queue_size_;  // total size of blocks in free_queue_
+  static inline size_t free_queue_size_;  // total size of blocks in free_queue_
   // protects free_queue_ and free_queue_size_
-  static SpinLock free_queue_lock_;
+  static inline SpinLock free_queue_lock_;
 
   // Names of allocation types (kMallocType, kNewType, kArrayNewType)
   static const char* const kAllocName[];
@@ -374,9 +363,12 @@ class MallocBlock {
   // malloc_page_fence option) then there's no size2 or magic2
   // (instead, the guard page begins where size2 would be).
 
-  size_t* size2_addr() { return (size_t*)((char*)&size2_ + size1_); }
   const size_t* size2_addr() const {
-    return (const size_t*)((char*)&size2_ + size1_);
+    return (const size_t*)((const char*)&size_and_magic2_ + size1_);
+  }
+  size_t* size2_addr() {
+    const auto* cthis = this;
+    return const_cast<size_t*>(cthis->size2_addr());
   }
 
   size_t* magic2_addr() { return (size_t*)(size2_addr() + 1); }
@@ -487,12 +479,26 @@ class MallocBlock {
 
  public:  // public accessors
 
-  void* data_addr() { return (void*)&size2_; }
-  const void* data_addr() const { return (const void*)&size2_; }
+  void* data_addr() { return (void*)&size_and_magic2_; }
+  const void* data_addr() const { return (const void*)&size_and_magic2_; }
 
-  static size_t data_offset() { return OFFSETOF_MEMBER(MallocBlock, size2_); }
+  static size_t data_offset() { return OFFSETOF_MEMBER(MallocBlock, size_and_magic2_); }
 
-  size_t data_size() const { return size1_; }
+  size_t raw_data_size() const { return size1_; }
+
+  // Note, this allocation might actually be from memalign, so raw_ptr
+  // might be >= data_addr() (see FromRawPointer and do_debug_memalign
+  // for how it works). So in order to get data size we should be
+  // careful.
+  size_t actual_data_size(const void* raw_ptr) const {
+    const char* raw_begin = static_cast<const char*>(data_addr());
+    const char* raw_end = raw_begin + raw_data_size();
+    CHECK_CONDITION(raw_begin <= raw_end);
+    CHECK_CONDITION(raw_begin <= raw_ptr);
+    CHECK_CONDITION(raw_ptr <= raw_end);
+
+    return raw_end - static_cast<const char*>(raw_ptr);
+  }
 
   void set_offset(int offset) { this->offset_ = offset; }
 
@@ -527,12 +533,13 @@ class MallocBlock {
         // of memory in this mode due to tremendous amount of wastage. There
         // is no point in propagating the error elsewhere.
         RAW_LOG(FATAL, "Out of memory: possibly due to page fence overhead: %s",
-                strerror(errno));
+                tcmalloc::SafeStrError(errno).c_str());
       }
       // Mark the page after the block inaccessible
       if (mprotect(p + (num_pages - 1) * pagesize, pagesize,
                    PROT_NONE|(malloc_page_fence_readable ? PROT_READ : 0))) {
-        RAW_LOG(FATAL, "Guard page setup failed: %s", strerror(errno));
+        RAW_LOG(FATAL, "Guard page setup failed: %s",
+                tcmalloc::SafeStrError(errno).c_str());
       }
       b = (MallocBlock*) (p + (num_pages - 1) * pagesize - sz);
     } else {
@@ -634,19 +641,11 @@ class MallocBlock {
 
   static void InitDeletedBuffer() {
     memset(kMagicDeletedBuffer, kMagicDeletedByte, sizeof(kMagicDeletedBuffer));
-    deleted_buffer_initialized_no_pthreads_ = true;
   }
 
   static void CheckForDanglingWrites(const MallocBlockQueueEntry& queue_entry) {
     // Initialize the buffer if necessary.
-    if (pthread_once)
-      pthread_once(&deleted_buffer_initialized_, &InitDeletedBuffer);
-    if (!deleted_buffer_initialized_no_pthreads_) {
-      // This will be the case on systems that don't link in pthreads,
-      // including on FreeBSD where pthread_once has a non-zero address
-      // (but doesn't do anything) even when pthreads isn't linked in.
-      InitDeletedBuffer();
-    }
+    deleted_buffer_initialized_.RunOnce(&InitDeletedBuffer);
 
     const unsigned char* p =
         reinterpret_cast<unsigned char*>(queue_entry.block);
@@ -693,9 +692,8 @@ class MallocBlock {
     const MallocBlock* b = queue_entry.block;
     const size_t size = queue_entry.size;
     if (queue_entry.num_deleter_pcs > 0) {
-      TracePrintf(STDERR_FILENO, "Deleted by thread %p\n",
-                  reinterpret_cast<void*>(
-                      PRINTABLE_PTHREAD(queue_entry.deleter_threadid)));
+      TracePrintf(STDERR_FILENO, "Deleted by thread %" GPRIxTHREADID "\n",
+                  PRINTABLE_THREADID(queue_entry.deleter_threadid));
 
       // We don't want to allocate or deallocate memory here, so we use
       // placement-new.  It's ok that we don't destroy this, since we're
@@ -727,7 +725,7 @@ class MallocBlock {
     RAW_LOG(FATAL,
             "Memory was written to after being freed.  MallocBlock: %p, user "
             "ptr: %p, size: %zd.  If you can't find the source of the error, "
-            "try using ASan (http://code.google.com/p/address-sanitizer/), "
+            "try using ASan (https://github.com/google/sanitizers), "
             "Valgrind, or Purify, or study the "
             "output of the deleter's stack printed above.",
             b, b->data_addr(), size);
@@ -849,16 +847,8 @@ void DanglingWriteChecker() {
 const size_t MallocBlock::kMagicMalloc;
 const size_t MallocBlock::kMagicMMap;
 
-MallocBlock::AllocMap* MallocBlock::alloc_map_ = NULL;
-SpinLock MallocBlock::alloc_map_lock_(SpinLock::LINKER_INITIALIZED);
-
-FreeQueue<MallocBlockQueueEntry>* MallocBlock::free_queue_ = NULL;
-size_t MallocBlock::free_queue_size_ = 0;
-SpinLock MallocBlock::free_queue_lock_(SpinLock::LINKER_INITIALIZED);
-
 unsigned char MallocBlock::kMagicDeletedBuffer[1024];
-pthread_once_t MallocBlock::deleted_buffer_initialized_ = PTHREAD_ONCE_INIT;
-bool MallocBlock::deleted_buffer_initialized_no_pthreads_ = false;
+tcmalloc::TrivialOnce MallocBlock::deleted_buffer_initialized_;
 
 const char* const MallocBlock::kAllocName[] = {
   "malloc",
@@ -901,7 +891,7 @@ static void TracePrintf(int fd, const char *fmt, ...) {
   while (*p != '\0') {              // until end of format string
     char *s = &numbuf[sizeof(numbuf)-1];
     if (p[0] == '%' && p[1] != 0) {  // handle % formats
-      int64 l = 0;
+      int64_t l = 0;
       unsigned long base = 0;
       if (*++p == 's') {                            // %s
         s = va_arg(ap, char *);
@@ -917,6 +907,10 @@ static void TracePrintf(int fd, const char *fmt, ...) {
         l = va_arg(ap, size_t);
         base = 10;
         p++;
+      } else if (*p == 'z' && p[1] == 'x') {        // %zx
+        l = va_arg(ap, size_t);
+        base = 16;
+        p++;
       } else if (*p == 'u') {                       // %u
         l = va_arg(ap, unsigned int);
         base = 10;
@@ -927,15 +921,15 @@ static void TracePrintf(int fd, const char *fmt, ...) {
         l = va_arg(ap, intptr_t);
         base = 16;
       } else {
-        write(STDERR_FILENO, "Unimplemented TracePrintf format\n", 33);
-        write(STDERR_FILENO, p, 2);
-        write(STDERR_FILENO, "\n", 1);
+        WRITE_TO_STDERR("Unimplemented TracePrintf format\n", 33);
+        WRITE_TO_STDERR(p, 2);
+        WRITE_TO_STDERR("\n", 1);
         abort();
       }
       p++;
       if (base != 0) {
         bool minus = (l < 0 && base == 10);
-        uint64 ul = minus? -l : l;
+        uint64_t ul = minus? -l : l;
         do {
           *--s = "0123456789abcdef"[ul % base];
           ul /= base;
@@ -952,14 +946,16 @@ static void TracePrintf(int fd, const char *fmt, ...) {
     }
     while (*s != 0) {
       if (i == sizeof(buf)) {
-        write(fd, buf, i);
+        auto unused = write(fd, buf, i);
+        (void)unused;
         i = 0;
       }
       buf[i++] = *s++;
     }
   }
   if (i != 0) {
-    write(fd, buf, i);
+    auto unused = write(fd, buf, i);
+    (void)unused;
   }
   va_end(ap);
 }
@@ -995,24 +991,24 @@ static int TraceFd() {
 // Print the hex stack dump on a single line.   PCs are separated by tabs.
 static void TraceStack(void) {
   void *pcs[16];
-  int n = GetStackTrace(pcs, sizeof(pcs)/sizeof(pcs[0]), 0);
+  int n = tcmalloc::GrabBacktrace(pcs, sizeof(pcs)/sizeof(pcs[0]), 0);
   for (int i = 0; i != n; i++) {
     TracePrintf(TraceFd(), "\t%p", pcs[i]);
   }
 }
 
 // This protects MALLOC_TRACE, to make sure its info is atomically written.
-static SpinLock malloc_trace_lock(SpinLock::LINKER_INITIALIZED);
+static SpinLock malloc_trace_lock;
 
-#define MALLOC_TRACE(name, size, addr)                                  \
-  do {                                                                  \
-    if (FLAGS_malloctrace) {                                            \
-      SpinLockHolder l(&malloc_trace_lock);                             \
-      TracePrintf(TraceFd(), "%s\t%zu\t%p\t%" GPRIuPTHREAD,      \
-                  name, size, addr, PRINTABLE_PTHREAD(pthread_self())); \
-      TraceStack();                                                     \
-      TracePrintf(TraceFd(), "\n");                                     \
-    }                                                                   \
+#define MALLOC_TRACE(name, size, addr)                                               \
+  do {                                                                               \
+    if (FLAGS_malloctrace) {                                                         \
+      SpinLockHolder l(&malloc_trace_lock);                                          \
+      TracePrintf(TraceFd(), "%s\t%zu\t%p\t%" GPRIuTHREADID,                         \
+                  name, size, addr, PRINTABLE_THREADID(std::this_thread::get_id())); \
+      TraceStack();                                                                  \
+      TracePrintf(TraceFd(), "\n");                                                  \
+    }                                                                                \
   } while (0)
 
 // ========================================================================= //
@@ -1025,7 +1021,8 @@ static SpinLock malloc_trace_lock(SpinLock::LINKER_INITIALIZED);
 // to use it.
 void __malloctrace_write(const char *buf, size_t size) {
   if (FLAGS_malloctrace) {
-    write(TraceFd(), buf, size);
+    auto unused = write(TraceFd(), buf, size);
+    (void)unused;
   }
 }
 
@@ -1034,6 +1031,15 @@ void __malloctrace_write(const char *buf, size_t size) {
 // General debug allocation/deallocation
 
 static inline void* DebugAllocate(size_t size, int type) {
+#if defined(__APPLE__)
+  // OSX malloc zones integration has some odd behavior. When
+  // GetAllocatedSize returns 0 it appears to assume something wrong
+  // about the pointer. And since in debug allocator we can return 0
+  // if original size was also 0, lets avoid this case. But only on
+  // OSX. It weakens debug checks a bit, but it unbreaks some tests
+  // (around realloc/free of 0-sized chunks).
+  if (size == 0) size = 1;
+#endif
   MallocBlock* ptr = MallocBlock::Allocate(size, type);
   if (ptr == NULL)  return NULL;
   MALLOC_TRACE("malloc", size, ptr->data_addr());
@@ -1042,7 +1048,7 @@ static inline void* DebugAllocate(size_t size, int type) {
 
 static inline void DebugDeallocate(void* ptr, int type, size_t given_size) {
   MALLOC_TRACE("free",
-               (ptr != 0 ? MallocBlock::FromRawPointer(ptr)->data_size() : 0),
+               (ptr != 0 ? MallocBlock::FromRawPointer(ptr)->actual_data_size(ptr) : 0),
                ptr);
   if (ptr)  MallocBlock::FromRawPointer(ptr)->Deallocate(type, given_size);
 }
@@ -1097,7 +1103,7 @@ class DebugMallocImplementation : public TCMallocImplementation {
     if (p) {
       RAW_CHECK(GetOwnership(p) != MallocExtension::kNotOwned,
                 "ptr not allocated by tcmalloc");
-      return MallocBlock::FromRawPointer(p)->data_size();
+      return MallocBlock::FromRawPointer(p)->actual_data_size(p);
     }
     return 0;
   }
@@ -1234,7 +1240,7 @@ static void force_frame() {
 }
 
 extern "C" PERFTOOLS_DLL_DECL void* tc_malloc(size_t size) PERFTOOLS_NOTHROW {
-  if (ThreadCache::IsUseEmergencyMalloc()) {
+  if (tcmalloc::IsUseEmergencyMalloc()) {
     return tcmalloc::EmergencyMalloc(size);
   }
   void* ptr = do_debug_malloc_or_debug_cpp_alloc(size);
@@ -1258,7 +1264,7 @@ extern "C" PERFTOOLS_DLL_DECL void tc_free_sized(void *ptr, size_t size) PERFTOO
 }
 
 extern "C" PERFTOOLS_DLL_DECL void* tc_calloc(size_t count, size_t size) PERFTOOLS_NOTHROW {
-  if (ThreadCache::IsUseEmergencyMalloc()) {
+  if (tcmalloc::IsUseEmergencyMalloc()) {
     return tcmalloc::EmergencyCalloc(count, size);
   }
   // Overflow check
@@ -1302,22 +1308,13 @@ extern "C" PERFTOOLS_DLL_DECL void* tc_realloc(void* ptr, size_t size) PERFTOOLS
   // return null
   if (p == NULL)  return NULL;
 
-  // if ptr was allocated via memalign, then old->data_size() is not
-  // start of user data. So we must be careful to copy only user-data
-  char *old_begin = (char *)old->data_addr();
-  char *old_end = old_begin + old->data_size();
-
-  ssize_t old_ssize = old_end - (char *)ptr;
-  CHECK_CONDITION(old_ssize >= 0);
-
-  size_t old_size = (size_t)old_ssize;
-  CHECK_CONDITION(old_size <= old->data_size());
+  size_t old_size = old->actual_data_size(ptr);
 
   memcpy(p->data_addr(), ptr, (old_size < size) ? old_size : size);
   MallocHook::InvokeDeleteHook(ptr);
   MallocHook::InvokeNewHook(p->data_addr(), size);
   DebugDeallocate(ptr, MallocBlock::kMallocType, 0);
-  MALLOC_TRACE("realloc", p->data_size(), p->data_addr());
+  MALLOC_TRACE("realloc", p->actual_data_size(p->data_addr()), p->data_addr());
   return p->data_addr();
 }
 
@@ -1436,8 +1433,8 @@ static void *retry_debug_memalign(void *arg) {
   return do_debug_memalign(data->align, data->size, data->type);
 }
 
-ATTRIBUTE_ALWAYS_INLINE
-inline void* do_debug_memalign_or_debug_cpp_memalign(size_t align,
+ALWAYS_INLINE
+void* do_debug_memalign_or_debug_cpp_memalign(size_t align,
                                                      size_t size,
                                                      int type,
                                                      bool from_operator,
@@ -1500,8 +1497,6 @@ extern "C" PERFTOOLS_DLL_DECL void* tc_pvalloc(size_t size) PERFTOOLS_NOTHROW {
   return p;
 }
 
-#if defined(ENABLE_ALIGNED_NEW_DELETE)
-
 extern "C" PERFTOOLS_DLL_DECL void* tc_new_aligned(size_t size, std::align_val_t align) {
   void* result = do_debug_memalign_or_debug_cpp_memalign(static_cast<size_t>(align), size, MallocBlock::kNewType, true, false);
   MallocHook::InvokeNewHook(result, size);
@@ -1560,8 +1555,6 @@ extern "C" PERFTOOLS_DLL_DECL void tc_deletearray_aligned_nothrow(void* p, std::
   tc_deletearray(p);
 }
 
-#endif // defined(ENABLE_ALIGNED_NEW_DELETE)
-
 // malloc_stats just falls through to the base implementation.
 extern "C" PERFTOOLS_DLL_DECL void tc_malloc_stats(void) PERFTOOLS_NOTHROW {
   do_malloc_stats();
@@ -1573,7 +1566,13 @@ extern "C" PERFTOOLS_DLL_DECL int tc_mallopt(int cmd, int value) PERFTOOLS_NOTHR
 
 #ifdef HAVE_STRUCT_MALLINFO
 extern "C" PERFTOOLS_DLL_DECL struct mallinfo tc_mallinfo(void) PERFTOOLS_NOTHROW {
-  return do_mallinfo();
+  return do_mallinfo<struct mallinfo>();
+}
+#endif
+
+#ifdef HAVE_STRUCT_MALLINFO2
+extern "C" PERFTOOLS_DLL_DECL struct mallinfo2 tc_mallinfo2(void) PERFTOOLS_NOTHROW {
+  return do_mallinfo<struct mallinfo2>();
 }
 #endif
 

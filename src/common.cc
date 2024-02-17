@@ -50,9 +50,9 @@ namespace tcmalloc {
 
 // Define the maximum number of object per classe type to transfer between
 // thread and central caches.
-static int32 FLAGS_tcmalloc_transfer_num_objects;
+static int32_t FLAGS_tcmalloc_transfer_num_objects;
 
-static const int32 kDefaultTransferNumObjecs = 32;
+static constexpr int32_t kDefaultTransferNumObjecs = 32;
 
 // The init function is provided to explicit initialize the variable value
 // from the env. var to avoid C++ global construction that might defer its
@@ -130,8 +130,19 @@ int SizeMap::NumMoveSize(size_t size) {
 void SizeMap::Init() {
   InitTCMallocTransferNumObjects();
 
+#if (!defined(_WIN32) || defined(TCMALLOC_BRAVE_EFFECTIVE_PAGE_SIZE)) && !defined(TCMALLOC_COWARD_EFFECTIVE_PAGE_SIZE)
   size_t native_page_size = tcmalloc::commandlineflags::StringToLongLong(
     TCMallocGetenvSafe("TCMALLOC_OVERRIDE_PAGESIZE"), getpagesize());
+#else
+  // So windows getpagesize() returns 64k. Because that is
+  // "granularity size" w.r.t. their virtual memory facility. So kinda
+  // maybe not a bad idea to also have effective logical pages at 64k
+  // too. But it breaks frag_unittest (for mostly harmless
+  // reason). And I am not brave enough to have our behavior change so
+  // much on windows (which isn't that much; people routinely run 256k
+  // logical pages anyways).
+  constexpr size_t native_page_size = kPageSize;
+#endif
 
   size_t min_span_size = std::max<size_t>(native_page_size, kPageSize);
   if (min_span_size > kPageSize && (min_span_size % kPageSize) != 0) {
@@ -265,7 +276,7 @@ static const size_t kMetadataAllignment = sizeof(MemoryAligner);
 static char *metadata_chunk_alloc_;
 static size_t metadata_chunk_avail_;
 
-static SpinLock metadata_alloc_lock(SpinLock::LINKER_INITIALIZED);
+static SpinLock metadata_alloc_lock;
 
 void* MetaDataAlloc(size_t bytes) {
   if (bytes >= kMetadataAllocChunkSize) {

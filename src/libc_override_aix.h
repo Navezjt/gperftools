@@ -1,5 +1,5 @@
 // -*- Mode: C++; c-basic-offset: 2; indent-tabs-mode: nil -*-
-// Copyright (c) 2014, gperftools Contributors
+// Copyright (c) 2021, IBM Ltd.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -28,58 +28,35 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef EMERGENCY_MALLOC_H
-#define EMERGENCY_MALLOC_H
-#include "config.h"
+// ---
+// Author: Chris Cambly <ccambly@ca.ibm.com>
+//
+// Used to override malloc routines on AIX
 
-#include <stddef.h>
+#ifndef TCMALLOC_LIBC_OVERRIDE_AIX_INL_H_
+#define TCMALLOC_LIBC_OVERRIDE_AIX_INL_H_
 
-#include "base/basictypes.h"
-#include "common.h"
-#include "thread_cache_ptr.h"
-
-namespace tcmalloc {
-
-static constexpr uintptr_t kEmergencyArenaShift = 20+4; // 16 megs
-static constexpr uintptr_t kEmergencyArenaSize = uintptr_t{1} << kEmergencyArenaShift;
-
-ATTRIBUTE_HIDDEN extern char *emergency_arena_start;
-ATTRIBUTE_HIDDEN extern uintptr_t emergency_arena_start_shifted;;
-
-ATTRIBUTE_HIDDEN void *EmergencyMalloc(size_t size);
-ATTRIBUTE_HIDDEN void EmergencyFree(void *p);
-ATTRIBUTE_HIDDEN void *EmergencyCalloc(size_t n, size_t elem_size);
-ATTRIBUTE_HIDDEN void *EmergencyRealloc(void *old_ptr, size_t new_size);
-
-static inline bool IsEmergencyPtr(const void *_ptr) {
-  uintptr_t ptr = reinterpret_cast<uintptr_t>(_ptr);
-  return PREDICT_FALSE((ptr >> kEmergencyArenaShift) == emergency_arena_start_shifted)
-    && emergency_arena_start_shifted;
-}
-
-class StacktraceScope {
-public:
-  StacktraceScope() : stacktrace_allowed_(EnterStacktraceScope()) { }
-  bool IsStacktraceAllowed() {
-    return stacktrace_allowed_;
-  }
-  ~StacktraceScope() {
-    if (stacktrace_allowed_) {
-      tcmalloc::ResetUseEmergencyMalloc();
-    }
-  }
-private:
-  static bool EnterStacktraceScope() {
-    if (tcmalloc::IsUseEmergencyMalloc()) {
-      return false;
-    }
-    tcmalloc::SetUseEmergencyMalloc();
-    return true;
-  }
-
-  const bool stacktrace_allowed_;
-};
-
-} // namespace tcmalloc
-
+#ifndef _AIX
+# error libc_override_aix.h is for AIX systems only.
 #endif
+
+extern "C" {
+  // AIX user-defined malloc replacement routines
+  void* __malloc__(size_t size) __THROW               ALIAS(tc_malloc);
+  void __free__(void* ptr) __THROW                    ALIAS(tc_free);
+  void* __realloc__(void* ptr, size_t size) __THROW   ALIAS(tc_realloc);
+  void* __calloc__(size_t n, size_t size) __THROW     ALIAS(tc_calloc);
+  int __posix_memalign__(void** r, size_t a, size_t s) __THROW ALIAS(tc_posix_memalign);
+  int __mallopt__(int cmd, int value) __THROW         ALIAS(tc_mallopt);
+#ifdef HAVE_STRUCT_MALLINFO
+  struct mallinfo __mallinfo__(void) __THROW          ALIAS(tc_mallinfo);
+#endif
+#ifdef HAVE_STRUCT_MALLINFO2
+  struct mallinfo2 __mallinfo2__(void) __THROW        ALIAS(tc_mallinfo2);
+#endif
+  void __malloc_init__(void)               { tc_free(tc_malloc(1));}
+  void* __malloc_prefork_lock__(void)      { /* nothing to lock */ }
+  void* __malloc_postfork_unlock__(void)   { /* nothing to unlock */}
+}   // extern "C"
+
+#endif  // TCMALLOC_LIBC_OVERRIDE_AIX_INL_H_

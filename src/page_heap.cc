@@ -33,17 +33,17 @@
 
 #include "config.h"
 
-#ifdef HAVE_INTTYPES_H
 #include <inttypes.h>                   // for PRIuPTR
-#endif
 #include <errno.h>                      // for ENOMEM, errno
 
+#include <algorithm>
 #include <limits>
 
-#include "gperftools/malloc_extension.h"      // for MallocRange, etc
 #include "base/basictypes.h"
 #include "base/commandlineflags.h"
+#include "gperftools/malloc_extension.h"      // for MallocRange, etc
 #include "internal_logging.h"  // for ASSERT, TCMalloc_Printer, etc
+#include "maybe_emergency_malloc.h"
 #include "page_heap_allocator.h"  // for PageHeapAllocator
 #include "static_vars.h"       // for Static
 #include "system-alloc.h"      // for TCMalloc_SystemAlloc, etc
@@ -66,6 +66,20 @@ DEFINE_int64(tcmalloc_heap_limit_mb,
 
 namespace tcmalloc {
 
+struct SCOPED_LOCKABLE PageHeap::LockingContext {
+  PageHeap * const heap;
+  size_t grown_by = 0;
+
+  explicit LockingContext(PageHeap* heap, SpinLock* lock) EXCLUSIVE_LOCK_FUNCTION(lock)
+      : heap(heap) {
+    lock->Lock();
+  }
+  ~LockingContext() UNLOCK_FUNCTION() {
+    heap->HandleUnlock(this);
+  }
+};
+
+
 PageHeap::PageHeap(Length smallest_span_size)
     : smallest_span_size_(smallest_span_size),
       pagemap_(MetaDataAlloc),
@@ -73,7 +87,7 @@ PageHeap::PageHeap(Length smallest_span_size)
       // Start scavenging at kMaxPages list
       release_index_(kMaxPages),
       aggressive_decommit_(false) {
-  COMPILE_ASSERT(kClassSizesMax <= (1 << PageMapCache::kValuebits), valuebits);
+  static_assert(kClassSizesMax <= (1 << PageMapCache::kValuebits));
   // smallest_span_size needs to be power of 2.
   CHECK_CONDITION((smallest_span_size_ & (smallest_span_size_-1)) == 0);
   for (int i = 0; i < kMaxPages; i++) {
@@ -83,6 +97,7 @@ PageHeap::PageHeap(Length smallest_span_size)
 }
 
 Span* PageHeap::SearchFreeAndLargeLists(Length n) {
+  ASSERT(lock_.IsHeld());
   ASSERT(Check());
   ASSERT(n > 0);
 
@@ -128,7 +143,37 @@ Length PageHeap::RoundUpSize(Length n) {
   return rounded_n;
 }
 
-Span* PageHeap::New(Length n) {
+void PageHeap::HandleUnlock(LockingContext* context) {
+  StackTrace* t = nullptr;
+  if (context->grown_by) {
+    t = Static::stacktrace_allocator()->New();
+    t->size = context->grown_by;
+  }
+
+  lock_.Unlock();
+
+  if (t) {
+    t->depth = tcmalloc::GrabBacktrace(t->stack, kMaxStackDepth-1, 0);
+    Static::push_growth_stack(t);
+  }
+}
+
+Span* PageHeap::NewWithSizeClass(Length n, uint32_t sizeclass) {
+  LockingContext context{this, &lock_};
+
+  Span* span = NewLocked(n, &context);
+  if (!span) {
+    return span;
+  }
+  InvalidateCachedSizeClass(span->start);
+  if (sizeclass) {
+    RegisterSizeClass(span, sizeclass);
+  }
+  return span;
+}
+
+Span* PageHeap::NewLocked(Length n, LockingContext* context) {
+  ASSERT(lock_.IsHeld());
   ASSERT(Check());
   n = RoundUpSize(n);
 
@@ -155,7 +200,7 @@ Span* PageHeap::New(Length n) {
     // penalized with higher count of minor page faults.
     //
     // See also large_heap_fragmentation_unittest.cc and
-    // https://code.google.com/p/gperftools/issues/detail?id=368
+    // https://github.com/gperftools/gperftools/issues/371
     ReleaseAtLeastNPages(static_cast<Length>(0x7fffffff));
 
     // then try again. If we are forced to grow heap because of large
@@ -169,7 +214,7 @@ Span* PageHeap::New(Length n) {
   }
 
   // Grow the heap and try again.
-  if (!GrowHeap(n)) {
+  if (!GrowHeap(n, context)) {
     ASSERT(stats_.unmapped_bytes+ stats_.committed_bytes==stats_.system_bytes);
     ASSERT(Check());
     // underlying SysAllocator likely set ENOMEM but we can get here
@@ -191,11 +236,14 @@ Span* PageHeap::NewAligned(Length n, Length align_pages) {
   if (alloc < n || alloc < align_pages) {
     // overflow means we asked huge amounts, so lets trigger normal
     // oom handling by asking enough to trigger oom.
-    Span* span = New(std::max(n, align_pages));
+    Span* span = New(std::numeric_limits<Length>::max());
     CHECK_CONDITION(span == nullptr);
     return nullptr;
   }
-  Span* span = New(alloc);
+
+  LockingContext context{this, &lock_};
+
+  Span* span = NewLocked(alloc, &context);
   if (PREDICT_FALSE(span == nullptr)) return nullptr;
 
   // Skip starting portion so that we end up aligned
@@ -207,19 +255,21 @@ Span* PageHeap::NewAligned(Length n, Length align_pages) {
   ASSERT(skip < alloc);
   if (skip > 0) {
     Span* rest = Split(span, skip);
-    Delete(span);
+    DeleteLocked(span);
     span = rest;
   }
 
   ASSERT(span->length >= n);
   if (span->length > n) {
     Span* trailer = Split(span, n);
-    Delete(trailer);
+    DeleteLocked(trailer);
   }
+  InvalidateCachedSizeClass(span->start);
   return span;
 }
 
 Span* PageHeap::AllocLarge(Length n) {
+  ASSERT(lock_.IsHeld());
   Span *best = NULL;
   Span *best_normal = NULL;
 
@@ -271,6 +321,7 @@ Span* PageHeap::AllocLarge(Length n) {
 }
 
 Span* PageHeap::Split(Span* span, Length n) {
+  ASSERT(lock_.IsHeld());
   ASSERT(0 < n);
   ASSERT(n < span->length);
   ASSERT(span->location == Span::IN_USE);
@@ -350,6 +401,12 @@ Span* PageHeap::Carve(Span* span, Length n) {
 }
 
 void PageHeap::Delete(Span* span) {
+  SpinLockHolder h(&lock_);
+  DeleteLocked(span);
+}
+
+void PageHeap::DeleteLocked(Span* span) {
+  ASSERT(lock_.IsHeld());
   ASSERT(Check());
   ASSERT(span->location == Span::IN_USE);
   ASSERT(span->length > 0);
@@ -391,6 +448,7 @@ Span* PageHeap::CheckAndHandlePreMerge(Span* span, Span* other) {
 }
 
 void PageHeap::MergeIntoFreeList(Span* span) {
+  ASSERT(lock_.IsHeld());
   ASSERT(span->location != Span::IN_USE);
 
   // Coalesce -- we guarantee that "p" != 0, so no bounds checking
@@ -443,6 +501,7 @@ void PageHeap::MergeIntoFreeList(Span* span) {
 }
 
 void PageHeap::PrependToFreeList(Span* span) {
+  ASSERT(lock_.IsHeld());
   ASSERT(span->location != Span::IN_USE);
   if (span->location == Span::ON_NORMAL_FREELIST)
     stats_.free_bytes += (span->length << kPageShift);
@@ -469,6 +528,7 @@ void PageHeap::PrependToFreeList(Span* span) {
 }
 
 void PageHeap::RemoveFromFreeList(Span* span) {
+  ASSERT(lock_.IsHeld());
   ASSERT(span->location != Span::IN_USE);
   if (span->location == Span::ON_NORMAL_FREELIST) {
     stats_.free_bytes -= (span->length << kPageShift);
@@ -489,6 +549,7 @@ void PageHeap::RemoveFromFreeList(Span* span) {
 }
 
 void PageHeap::IncrementalScavenge(Length n) {
+  ASSERT(lock_.IsHeld());
   // Fast path; not yet time to release memory
   scavenge_counter_ -= n;
   if (scavenge_counter_ >= 0) return;  // Not yet time to scavenge
@@ -536,6 +597,7 @@ Length PageHeap::ReleaseSpan(Span* s) {
 }
 
 Length PageHeap::ReleaseAtLeastNPages(Length num_pages) {
+  ASSERT(lock_.IsHeld());
   Length released_pages = 0;
 
   // Round robin through the lists of free spans, releasing a
@@ -572,8 +634,8 @@ Length PageHeap::ReleaseAtLeastNPages(Length num_pages) {
   return released_pages;
 }
 
-bool PageHeap::EnsureLimit(Length n, bool withRelease)
-{
+bool PageHeap::EnsureLimit(Length n, bool withRelease) {
+  ASSERT(lock_.IsHeld());
   Length limit = (FLAGS_tcmalloc_heap_limit_mb*1024*1024) >> kPageShift;
   if (limit == 0) return true; //there is no limit
 
@@ -596,7 +658,7 @@ bool PageHeap::EnsureLimit(Length n, bool withRelease)
   return takenPages + n <= limit;
 }
 
-void PageHeap::RegisterSizeClass(Span* span, uint32 sc) {
+void PageHeap::RegisterSizeClass(Span* span, uint32_t sc) {
   // Associate span object with all interior pages as well
   ASSERT(span->location == Span::IN_USE);
   ASSERT(GetDescriptor(span->start) == span);
@@ -607,14 +669,16 @@ void PageHeap::RegisterSizeClass(Span* span, uint32 sc) {
   }
 }
 
-void PageHeap::GetSmallSpanStats(SmallSpanStats* result) {
+void PageHeap::GetSmallSpanStatsLocked(SmallSpanStats* result) {
+  ASSERT(lock_.IsHeld());
   for (int i = 0; i < kMaxPages; i++) {
     result->normal_length[i] = DLL_Length(&free_[i].normal);
     result->returned_length[i] = DLL_Length(&free_[i].returned);
   }
 }
 
-void PageHeap::GetLargeSpanStats(LargeSpanStats* result) {
+void PageHeap::GetLargeSpanStatsLocked(LargeSpanStats* result) {
+  ASSERT(lock_.IsHeld());
   result->spans = 0;
   result->normal_pages = 0;
   result->returned_pages = 0;
@@ -629,6 +693,7 @@ void PageHeap::GetLargeSpanStats(LargeSpanStats* result) {
 }
 
 bool PageHeap::GetNextRange(PageID start, base::MallocRange* r) {
+  ASSERT(lock_.IsHeld());
   Span* span = reinterpret_cast<Span*>(pagemap_.Next(start));
   if (span == NULL) {
     return false;
@@ -659,15 +724,8 @@ bool PageHeap::GetNextRange(PageID start, base::MallocRange* r) {
   return true;
 }
 
-static void RecordGrowth(size_t growth) {
-  StackTrace* t = Static::stacktrace_allocator()->New();
-  t->depth = GetStackTrace(t->stack, kMaxStackDepth-1, 3);
-  t->size = growth;
-  t->stack[kMaxStackDepth-1] = reinterpret_cast<void*>(Static::growth_stacks());
-  Static::set_growth_stacks(t);
-}
-
-bool PageHeap::GrowHeap(Length n) {
+bool PageHeap::GrowHeap(Length n, LockingContext* context) {
+  ASSERT(lock_.IsHeld());
   ASSERT(kMaxPages >= kMinSystemAlloc);
   if (n > kMaxValidPages) return false;
   Length ask = (n>kMinSystemAlloc) ? n : static_cast<Length>(kMinSystemAlloc);
@@ -687,7 +745,7 @@ bool PageHeap::GrowHeap(Length n) {
     if (ptr == NULL) return false;
   }
   ask = actual_size >> kPageShift;
-  RecordGrowth(ask << kPageShift);
+  context->grown_by += ask << kPageShift;
 
   ++stats_.reserve_count;
   ++stats_.commit_count;
@@ -719,7 +777,7 @@ bool PageHeap::GrowHeap(Length n) {
     // any necessary coalescing to occur.
     Span* span = NewSpan(p, ask);
     RecordSpan(span);
-    Delete(span);
+    DeleteLocked(span);
     ASSERT(stats_.unmapped_bytes+ stats_.committed_bytes==stats_.system_bytes);
     ASSERT(Check());
     return true;
@@ -731,6 +789,7 @@ bool PageHeap::GrowHeap(Length n) {
 }
 
 bool PageHeap::Check() {
+  ASSERT(lock_.IsHeld());
   return true;
 }
 
