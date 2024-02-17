@@ -1,5 +1,5 @@
-// -*- Mode: C++; c-basic-offset: 2; indent-tabs-mode: nil -*-
-/* Copyright (c) 2009, Google Inc.
+/* -*- Mode: C++; c-basic-offset: 2; indent-tabs-mode: nil -*-
+ * Copyright (c) 2024, gperftools Contributors
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,37 +27,52 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * ---
- * This file is a Posix-specific part of spinlock_internal.cc
  */
+#include "config_for_unittests.h"
 
-#include <config.h>
-#include <errno.h>
-#ifdef HAVE_SCHED_H
-#include <sched.h>      /* For sched_yield() */
-#endif
-#include <time.h>       /* For nanosleep() */
+#include "base/proc_maps_iterator.h"
 
-namespace base {
-namespace internal {
+#include <stdio.h>
 
-void SpinLockDelay(std::atomic<int> *w, int32_t value, int loop) {
-  int save_errno = errno;
-  if (loop == 0) {
-  } else if (loop == 1) {
-    sched_yield();
-  } else {
-    struct timespec tm;
-    tm.tv_sec = 0;
-    tm.tv_nsec = base::internal::SuggestedDelayNS(loop);
-    nanosleep(&tm, NULL);
+#include <string>
+
+#include "base/generic_writer.h"
+
+int variable;
+
+// There is not much we can thoroughly test. But it is easy to test
+// that we're seeing at least .bss bits. We can also check that we saw
+// at least one executable mapping.
+void TestForEachMapping() {
+  bool seen_variable = false;
+  bool seen_executable = false;
+  bool ok = tcmalloc::ForEachProcMapping([&] (const tcmalloc::ProcMapping& mapping) {
+    const uintptr_t variable_addr = reinterpret_cast<uintptr_t>(&variable);
+    if (mapping.start <= variable_addr && variable_addr <= mapping.end) {
+      seen_variable = true;
+    }
+    if (std::string(mapping.flags).find_first_of('x') != std::string::npos) {
+      seen_executable = true;
+    }
+  });
+  RAW_CHECK(ok, "failed to open proc/self/maps");
+  RAW_CHECK(seen_variable, "");
+  RAW_CHECK(seen_executable, "");
+}
+
+void TestSaveMappingsNonEmpty() {
+  std::string s;
+  {
+    tcmalloc::StringGenericWriter writer(&s);
+    tcmalloc::SaveProcSelfMaps(&writer);
   }
-  errno = save_errno;
+  // Lets at least ensure we got something
+  CHECK_NE(s.size(), 0);
+  printf("Got the following:\n%s\n---\n", s.c_str());
 }
 
-void SpinLockWake(std::atomic<int>  *w, bool all) {
+int main() {
+  TestForEachMapping();
+  TestSaveMappingsNonEmpty();
+  printf("PASS\n");
 }
-
-} // namespace internal
-} // namespace base

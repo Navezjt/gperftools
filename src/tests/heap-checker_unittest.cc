@@ -62,11 +62,7 @@
 #ifdef HAVE_POLL_H
 #include <poll.h>
 #endif
-#if defined HAVE_STDINT_H
-#include <stdint.h>             // to get uint16_t (ISO naming madness)
-#elif defined HAVE_INTTYPES_H
-#include <inttypes.h>           // another place uint16_t might be defined
-#endif
+#include <stdint.h>
 #include <sys/types.h>
 #include <stdlib.h>
 #include <errno.h>              // errno
@@ -86,6 +82,8 @@
 #ifdef HAVE_PWD_H
 #include <pwd.h>
 #endif
+#include <spawn.h> // for posix_spawn
+#include <sys/wait.h> // waitpid etc
 
 #include <algorithm>
 #include <iostream>             // for cout
@@ -101,7 +99,7 @@
 #include "base/googleinit.h"
 #include "base/logging.h"
 #include "base/commandlineflags.h"
-#include "base/thread_lister.h"
+#include "base/linuxthreads.h"
 #include <gperftools/heap-checker.h>
 #include "memory_region_map.h"
 #include <gperftools/malloc_extension.h>
@@ -410,7 +408,7 @@ static bool RunSilent(HeapLeakChecker* check,
   // cases we're expecting a leak (we still print when --v is >= 1).
   // This way, the logging output is less confusing: we only print
   // "we detected a leak", and how to diagnose it, for *unexpected* leaks.
-  int32 old_FLAGS_verbose = FLAGS_verbose;
+  int32_t old_FLAGS_verbose = FLAGS_verbose;
   if (!VLOG_IS_ON(1))             // not on a verbose setting
     FLAGS_verbose = FATAL;        // only log fatal errors
   const bool retval = (check->*func)();
@@ -499,7 +497,7 @@ static void TestHeapLeakCheckerDeathInverse() {
   DeAllocHidden(&bar);
   Pause();
   VerifyLeaks(&check, SAME_HEAP,
-              100 * static_cast<int64>(sizeof(int)),
+              100 * static_cast<int64_t>(sizeof(int)),
               1);
   DeAllocHidden(&foo);
 }
@@ -803,6 +801,7 @@ static void DirectTestSTLAlloc(Alloc allocator, const char* name) {
   CHECK(check.BriefSameHeap());  // just in case
 }
 
+static SpinLock grplock;
 static struct group* grp = NULL;
 static const int kKeys = 50;
 static pthread_key_t key[kKeys];
@@ -846,15 +845,19 @@ static void TestLibCAllocate() {
   void *stack[1];
   backtrace(stack, 1);
 #endif
+
+  if (grplock.TryLock()) {
 #ifdef HAVE_GRP_H
-  gid_t gid = getgid();
-  getgrgid(gid);
-  if (grp == NULL)  grp = getgrent();  // a race condition here is okay
-  getgrnam(grp->gr_name);
+    gid_t gid = getgid();
+    getgrgid(gid);
+    if (grp == NULL)  grp = getgrent();  // a race condition here is okay
+    getgrnam(grp->gr_name);
 #endif
 #ifdef HAVE_PWD_H
-  getpwuid(geteuid());
+    getpwuid(geteuid());
 #endif
+    grplock.Unlock();
+  }
 }
 
 // Continuous random heap memory activity to try to disrupt heap checking.
@@ -1211,8 +1214,8 @@ REGISTER_OBJ_MAKER(MltD2_as_IB, InterfaceB* p = new(initialized) ClassMltD2;)
 // which store a platform-independent-sized refcount in the first
 // few bytes and keeps a pointer pointing behind the refcount.
 REGISTER_OBJ_MAKER(unicode_string,
-  char* p = new char[sizeof(uint32) * 10];
-  p += sizeof(uint32);
+  char* p = new char[sizeof(uint32_t) * 10];
+  p += sizeof(uint32_t);
 )
 // similar, but for platform-dependent-sized refcount
 REGISTER_OBJ_MAKER(ref_counted,
@@ -1377,7 +1380,46 @@ static int Pass() {
   return 0;
 }
 
+bool spawn_subtest(const char* mode, char** argv) {
+  putenv(strdup((std::string{"HEAPCHECK="} + std::string(mode)).c_str()));
+  int pid;
+  printf("Spawning heapcheck test with HEAPCHECK=%s...\n", mode);
+
+  int rv = posix_spawn(&pid, "/proc/self/exe", nullptr, nullptr, argv, environ);
+  if (rv != 0) {
+    errno = rv;
+    perror("posix_spawn");
+    abort();
+  }
+  do {
+    if (waitpid(pid, &rv, 0) < 0) {
+      if (errno == EINTR) {
+        continue; // try again
+      }
+      perror("waitpid");
+      abort();
+    }
+  } while (false);
+  if (!WIFEXITED(rv)) {
+    LOGF << std::hex << "weird waitpid status: " << rv;
+    LOG(FATAL, "\n");
+  }
+
+  rv = WEXITSTATUS(rv);
+  printf("Test in mode %s finished with status %d\n", mode, rv);
+
+  return (rv == 0);
+}
+
 int main(int argc, char** argv) {
+  if (getenv("HEAPCHECK") == nullptr) {
+    CHECK(!HeapLeakChecker::IsActive());
+
+    bool ok = (spawn_subtest("", argv) && spawn_subtest("local", argv)
+               && spawn_subtest("normal", argv) && spawn_subtest("strict", argv));
+    return ok ? 0 : 1;
+  }
+
   run_hidden_ptr = DoRunHidden;
   wipe_stack_ptr = DoWipeStack;
   if (!HeapLeakChecker::IsActive()) {

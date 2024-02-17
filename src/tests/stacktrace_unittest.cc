@@ -35,19 +35,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// On those architectures we can and should test if backtracing with
-// ucontext and from signal handler works
-#if __GNUC__ && __linux__ && (__x86_64__ || __aarch64__ || __riscv)
+// Correctly capturing backtrace from signal handler is most
+// brittle. A number of configurations on Linux work, but not
+// all. Same applies to BSDs. But lets somewhat broadly ask those
+// setups to be tested. In general, if right backtraces are needed for
+// CPU profiler, this test should pass as well.
+#if __linux__ || (__FreeBSD__ && (__x86_64__ || __i386__)) || __NetBSD__
 #include <signal.h>
+#include <sys/time.h>
 #define TEST_UCONTEXT_BITS 1
 #endif
+
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#undef TEST_UCONTEXT_BITS
+#  endif
+#endif
+
+#include <vector>
 
 #include "base/commandlineflags.h"
 #include "base/logging.h"
 #include <gperftools/stacktrace.h>
 #include "tests/testutil.h"
-
-namespace {
 
 // Obtain a backtrace, verify that the expected callers are present in the
 // backtrace, and maybe print the backtrace to stdout.
@@ -62,6 +72,8 @@ struct AddressRange {
 
 // Expected function [start,end] range.
 AddressRange expected_range[BACKTRACE_STEPS];
+
+bool skipping_ucontext;
 
 #if __GNUC__
 // Using GCC extension: address of a label can be taken with '&&label'.
@@ -117,32 +129,33 @@ void CheckRetAddrIsInFunction(void *ret_addr, const AddressRange &range)
 
 //-----------------------------------------------------------------------//
 
+extern "C" {
+
 #if TEST_UCONTEXT_BITS
 
 struct get_stack_trace_args {
-	int *size_ptr;
-	void **result;
-	int max_depth;
-	uintptr_t where;
+  volatile bool ready;
+  volatile bool captured;
+
+  int *size_ptr;
+  void **result;
+  int max_depth;
 } gst_args;
 
 static
 void SignalHandler(int dummy, siginfo_t *si, void* ucv) {
-	auto uc = static_cast<ucontext_t*>(ucv);
+  if (!gst_args.ready || gst_args.captured) {
+    return;
+  }
 
-#ifdef __riscv
-	uc->uc_mcontext.__gregs[REG_PC] = gst_args.where;
-#elif __aarch64__
-	uc->uc_mcontext.pc = gst_args.where;
-#else
-	uc->uc_mcontext.gregs[REG_RIP] = gst_args.where;
-#endif
+  gst_args.captured = true;
 
-	*gst_args.size_ptr = GetStackTraceWithContext(
-		gst_args.result,
-		gst_args.max_depth,
-		2,
-		uc);
+  auto uc = static_cast<ucontext_t*>(ucv);
+
+  *gst_args.size_ptr = GetStackTraceWithContext(gst_args.result,
+                                                gst_args.max_depth,
+                                                2,
+                                                uc);
 }
 
 int ATTRIBUTE_NOINLINE CaptureLeafUContext(void **stack, int stack_len) {
@@ -153,27 +166,38 @@ int ATTRIBUTE_NOINLINE CaptureLeafUContext(void **stack, int stack_len) {
 
   printf("Capturing stack trace from signal's ucontext\n");
   struct sigaction sa;
+  struct sigaction old_sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_sigaction = SignalHandler;
   sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
-  int rv = sigaction(SIGSEGV, &sa, nullptr);
+  int rv = sigaction(SIGPROF, &sa, &old_sa);
   CHECK(rv == 0);
 
   gst_args.size_ptr = &size;
   gst_args.result = stack;
   gst_args.max_depth = stack_len;
-  gst_args.where = reinterpret_cast<uintptr_t>(noopt(&&after));
+  gst_args.captured = false;
+  gst_args.ready = false;
 
-  // now, "write" to null pointer and trigger sigsegv to run signal
-  // handler. It'll then change PC to after, as if we jumped one line
-  // below.
-  *noopt(reinterpret_cast<void**>(0)) = 0;
-  // this is not reached, but gcc gets really odd if we don't actually
-  // use computed goto.
-  static void* jump_target = &&after;
-  goto *noopt(&jump_target);
+  struct itimerval it;
+  it.it_interval.tv_sec = 0;
+  it.it_interval.tv_usec = 0;
+  it.it_value.tv_sec = 0;
+  it.it_value.tv_usec = 1;
 
-after:
+  rv = setitimer(ITIMER_PROF, &it, nullptr);
+  CHECK(rv == 0);
+
+  // SignalHandler will run somewhere here, making sure we capture
+  // backtrace from signal handler
+  gst_args.ready = true;
+  while (!gst_args.captured) {
+    // do nothing
+  }
+
+  rv = sigaction(SIGPROF, &old_sa, nullptr);
+  CHECK(rv == 0);
+
   printf("Obtained %d stack frames.\n", size);
   CHECK_GE(size, 1);
   CHECK_LE(size, stack_len);
@@ -200,22 +224,60 @@ int ATTRIBUTE_NOINLINE CaptureLeafPlain(void **stack, int stack_len) {
   return size;
 }
 
+int ATTRIBUTE_NOINLINE CaptureLeafPlainEmptyUCP(void **stack, int stack_len) {
+  INIT_ADDRESS_RANGE(CheckStackTraceLeaf, start, end, &expected_range[0]);
+  DECLARE_ADDRESS_LABEL(start);
+
+  int size = GetStackTraceWithContext(stack, stack_len, 0, nullptr);
+
+  printf("Obtained %d stack frames.\n", size);
+  CHECK_GE(size, 1);
+  CHECK_LE(size, stack_len);
+
+  DECLARE_ADDRESS_LABEL(end);
+
+  return size;
+}
+
+int ATTRIBUTE_NOINLINE CaptureLeafWSkip(void **stack, int stack_len) {
+  INIT_ADDRESS_RANGE(CheckStackTraceLeaf, start, end, &expected_range[0]);
+  DECLARE_ADDRESS_LABEL(start);
+
+  auto trampoline = [] (void **stack, int stack_len) ATTRIBUTE_NOINLINE {
+    int rv = GetStackTrace(stack, stack_len, 1);
+    (void)*(void * volatile *)(stack); // prevent tail-calling GetStackTrace
+    return rv;
+  };
+
+  int size = trampoline(stack, stack_len);
+
+  printf("Obtained %d stack frames.\n", size);
+  CHECK_GE(size, 1);
+  CHECK_LE(size, stack_len);
+
+  DECLARE_ADDRESS_LABEL(end);
+
+  return size;
+}
+
 void ATTRIBUTE_NOINLINE CheckStackTrace(int);
 
 int (*leaf_capture_fn)(void**, int) = CaptureLeafPlain;
+int leaf_capture_len = 20;
 
 void ATTRIBUTE_NOINLINE CheckStackTraceLeaf(int i) {
-  const int STACK_LEN = 20;
-  void *stack[STACK_LEN];
-  int size;
+  std::vector<void*> stack(leaf_capture_len + 1);
+  stack[leaf_capture_len] = (void*)0x42;  // we will check that this value is not overwritten
+  int size = 0;
 
   ADJUST_ADDRESS_RANGE_FROM_RA(&expected_range[1]);
 
-  size = leaf_capture_fn(stack, STACK_LEN);
+  size = leaf_capture_fn(stack.data(), leaf_capture_len);
+  CHECK_EQ(stack[leaf_capture_len], (void*)0x42);
 
 #ifdef HAVE_EXECINFO_H
   {
-    char **strings = backtrace_symbols(stack, size);
+    char **strings = backtrace_symbols(stack.data(), size);
     for (int i = 0; i < size; i++)
       printf("%s %p\n", strings[i], stack[i]);
     printf("CheckStackTrace() addr: %p\n", &CheckStackTrace);
@@ -223,11 +285,12 @@ void ATTRIBUTE_NOINLINE CheckStackTraceLeaf(int i) {
   }
 #endif
 
-  for (int i = 0, j = 0; i < BACKTRACE_STEPS; i++, j++) {
+  for (int i = 0, j = 0; i < BACKTRACE_STEPS && j < size; i++, j++) {
     if (i == 1 && j == 1) {
       // this is expected to be our function for which we don't
       // establish bounds. So skip.
-      j++;
+      i--;
+      continue;
     }
     printf("Backtrace %d: expected: %p..%p  actual: %p ... ",
            i, expected_range[i].start, expected_range[i].end, stack[j]);
@@ -281,18 +344,59 @@ void ATTRIBUTE_NOINLINE CheckStackTrace(int i) {
   DECLARE_ADDRESS_LABEL(end);
 }
 
-}  // namespace
+}  // extern "C"
+
 //-----------------------------------------------------------------------//
 
-int main(int argc, char ** argv) {
+void RunTest() {
+  CheckStackTrace(0);
+  printf("PASS\n");
+
+  printf("Will test capturing stack trace with nullptr ucontext\n");
+  leaf_capture_fn = CaptureLeafPlainEmptyUCP;
+  CheckStackTrace(0);
+  printf("PASS\n");
+
+  printf("Will test capturing stack trace with skipped frames\n");
+  leaf_capture_fn = CaptureLeafWSkip;
   CheckStackTrace(0);
   printf("PASS\n");
 
 #if TEST_UCONTEXT_BITS
-  leaf_capture_fn = CaptureLeafUContext;
-  CheckStackTrace(0);
-  printf("PASS\n");
+  if (!skipping_ucontext) {
+    leaf_capture_fn = CaptureLeafUContext;
+    CheckStackTrace(0);
+    printf("PASS\n");
+  }
 #endif  // TEST_UCONTEXT_BITS
+}
+
+extern "C" {
+const char* TEST_bump_stacktrace_implementation(const char*);
+}
+
+int main(int argc, char** argv) {
+  if (argc > 1 && strcmp(argv[1], "--skip-ucontext") == 0) {
+    argc--;
+    argv--;
+    skipping_ucontext = true;
+  }
+
+  for (;;) {
+    // first arg if given is stacktrace implementation we want to test
+    const char* name = TEST_bump_stacktrace_implementation((argc > 1) ? argv[1] : nullptr);
+    if (!name) {
+      break;
+    }
+    printf("Testing stacktrace implementation: %s\n", name);
+
+    leaf_capture_len = 20;
+    RunTest();
+
+    printf("\nSet max capture length to 3:\n");
+    leaf_capture_len = 3;  // less than stack depth
+    RunTest();
+  }
 
   return 0;
 }

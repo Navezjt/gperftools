@@ -31,6 +31,8 @@
 // ---
 // Author: Fred Akalin
 
+#include "config_for_unittests.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> // for memcmp
@@ -149,6 +151,7 @@ TEST(DebugAllocationTest, DoubleFree) {
 
 TEST(DebugAllocationTest, StompBefore) {
   int* pint = noopt(new int);
+  (void)pint;
 #ifndef NDEBUG   // don't stomp memory if we're not in a position to detect it
   pint[-1] = 5;
   IF_DEBUG_EXPECT_DEATH(delete pint, "a word before object");
@@ -157,6 +160,7 @@ TEST(DebugAllocationTest, StompBefore) {
 
 TEST(DebugAllocationTest, StompAfter) {
   int* pint = noopt(new int);
+  (void)pint;
 #ifndef NDEBUG   // don't stomp memory if we're not in a position to detect it
   pint[1] = 5;
   IF_DEBUG_EXPECT_DEATH(delete pint, "a word after object");
@@ -259,22 +263,39 @@ TEST(DebugAllocationTest, CurrentlyAllocated) {
 }
 
 TEST(DebugAllocationTest, GetAllocatedSizeTest) {
-#if 1
   // When debug_allocation is in effect, GetAllocatedSize should return
   // exactly requested size, since debug_allocation doesn't allow users
   // to write more than that.
   for (int i = 0; i < 10; ++i) {
+#ifdef __APPLE__
+    if (i == 0) continue;
+#endif
     void *p = noopt(malloc(i));
     EXPECT_EQ(i, MallocExtension::instance()->GetAllocatedSize(p));
     free(p);
+
+    p = tc_memalign(16, i);
+    auto amount = MallocExtension::instance()->GetAllocatedSize(p);
+    EXPECT_LE(i, amount);
+    memset(p, 0xff, amount);
+    tc_free(p);
   }
-#endif
+
   void* a = noopt(malloc(1000));
   EXPECT_GE(MallocExtension::instance()->GetAllocatedSize(a), 1000);
   // This is just a sanity check.  If we allocated too much, alloc is broken
   EXPECT_LE(MallocExtension::instance()->GetAllocatedSize(a), 5000);
-  EXPECT_GE(MallocExtension::instance()->GetEstimatedAllocatedSize(1000), 1000);
   free(a);
+
+  EXPECT_GE(MallocExtension::instance()->GetEstimatedAllocatedSize(1000), 1000);
+
+  a = tc_memalign(16, 1000);
+  auto amount = MallocExtension::instance()->GetAllocatedSize(a);
+  EXPECT_GE(amount, 1000);
+  // This is just a sanity check.  If we allocated too much, alloc is broken
+  EXPECT_LE(amount, 5000);
+  memset(a, 0xff, amount);
+  tc_free(a);
 }
 
 TEST(DebugAllocationTest, HugeAlloc) {
@@ -284,6 +305,8 @@ TEST(DebugAllocationTest, HugeAlloc) {
   size_t kTooBig = ~static_cast<size_t>(0);
   void* a = NULL;
 
+  (void)kTooBig;
+  (void)a;
 #ifndef NDEBUG
 
   a = noopt(malloc(noopt(kTooBig)));

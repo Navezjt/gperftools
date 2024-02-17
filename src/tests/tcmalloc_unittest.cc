@@ -63,32 +63,29 @@
 // doesn't sub-include stdlib.h, so we'll still get posix_memalign
 // when we #include stdlib.h.  Blah.
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>        // for testing sbrk hooks
+#include <unistd.h>                 // for testing sbrk hooks
 #endif
-#include "tcmalloc.h"      // must come early, to pick up posix_memalign
+#include "tcmalloc_internal.h"      // must come early, to pick up posix_memalign
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#ifdef HAVE_STDINT_H
-#include <stdint.h>        // for intptr_t
-#endif
-#include <sys/types.h>     // for size_t
+#include <stdint.h>                 // for intptr_t
+#include <sys/types.h>              // for size_t
 #ifdef HAVE_FCNTL_H
-#include <fcntl.h>         // for open; used with mmap-hook test
-#endif
-#ifdef HAVE_MMAP
-#include <sys/mman.h>      // for testing mmap hooks
+#include <fcntl.h>                  // for open; used with mmap-hook test
 #endif
 #ifdef HAVE_MALLOC_H
-#include <malloc.h>        // defines pvalloc/etc on cygwin
+#include <malloc.h>                 // defines pvalloc/etc on cygwin
 #endif
 #include <assert.h>
-#include <vector>
+
 #include <algorithm>
-#include <string>
+#include <mutex>
 #include <new>
+#include <string>
+#include <vector>
+
 #include "base/logging.h"
-#include "base/simple_mutex.h"
 #include "gperftools/malloc_hook.h"
 #include "gperftools/malloc_extension.h"
 #include "gperftools/nallocx.h"
@@ -144,26 +141,16 @@ static inline int PosixMemalign(void** ptr, size_t align, size_t size) {
 
 #endif
 
-#if defined(ENABLE_ALIGNED_NEW_DELETE)
-
 #define OVERALIGNMENT 64
 
 struct overaligned_type
 {
-#if defined(__GNUC__)
-  __attribute__((__aligned__(OVERALIGNMENT)))
-#elif defined(_MSC_VER)
-  __declspec(align(OVERALIGNMENT))
-#else
   alignas(OVERALIGNMENT)
-#endif
   unsigned char data[OVERALIGNMENT * 2]; // make the object size different from
                                          // alignment to make sure the correct
                                          // values are passed to the new/delete
                                          // implementation functions
 };
-
-#endif // defined(ENABLE_ALIGNED_NEW_DELETE)
 
 // On systems (like freebsd) that don't define MAP_ANONYMOUS, use the old
 // form of the name instead.
@@ -243,8 +230,6 @@ static const size_t kNotTooBig = 100000;
 // interested in testing their logic, so we have to make sure we're
 // not *too* big.
 static const size_t kTooBig = kMaxSize - 100000;
-
-static int news_handled = 0;
 
 // Global array of threads
 class TesterThread;
@@ -359,7 +344,7 @@ class AllocatorState : public TestHarness {
     if (Uniform(100) < memalign_fraction_ * 100) {
       // Try a few times to find a reasonable alignment, or fall back on malloc.
       for (int i = 0; i < 5; i++) {
-        size_t alignment = 1 << Uniform(FLAGS_lg_max_memalign);
+        size_t alignment = size_t{1} << Uniform(FLAGS_lg_max_memalign);
         if (alignment >= sizeof(intptr_t) &&
             (size < sizeof(intptr_t) ||
              alignment < FLAGS_memalign_max_alignment_ratio * size)) {
@@ -390,29 +375,27 @@ class TesterThread {
     int         generation;             // Generation counter of object contents
   };
 
-  Mutex                 lock_;          // For passing in another thread's obj
+  std::mutex            lock_;          // For passing in another thread's obj
   int                   id_;            // My thread id
   AllocatorState        rnd_;           // For generating random numbers
   vector<Object>        heap_;          // This thread's heap
   vector<Object>        passed_;        // Pending objects passed from others
   size_t                heap_size_;     // Current heap size
-  int                   locks_ok_;      // Number of OK TryLock() ops
-  int                   locks_failed_;  // Number of failed TryLock() ops
 
   // Type of operations
   enum Type { ALLOC, FREE, UPDATE, PASS };
 
   // ACM minimal standard random number generator.  (re-entrant.)
   class ACMRandom {
-    int32 seed_;
+    int32_t seed_;
    public:
-    explicit ACMRandom(int32 seed) { seed_ = seed; }
-    int32 Next() {
-      const int32 M = 2147483647L;   // 2^31-1
-      const int32 A = 16807;
+    explicit ACMRandom(int32_t seed) { seed_ = seed; }
+    int32_t Next() {
+      const int32_t M = 2147483647L;   // 2^31-1
+      const int32_t A = 16807;
       // In effect, we are computing seed_ = (seed_ * A) % M, where M = 2^31-1
-      uint32 lo = A * (int32)(seed_ & 0xFFFF);
-      uint32 hi = A * (int32)((uint32)seed_ >> 16);
+      uint32_t lo = A * (int32_t)(seed_ & 0xFFFF);
+      uint32_t hi = A * (int32_t)((uint32_t)seed_ >> 16);
       lo += (hi & 0x7FFF) << 16;
       if (lo > M) {
         lo &= M;
@@ -423,7 +406,7 @@ class TesterThread {
         lo &= M;
         ++lo;
       }
-      return (seed_ = (int32) lo);
+      return (seed_ = (int32_t) lo);
     }
   };
 
@@ -431,18 +414,10 @@ class TesterThread {
   TesterThread(int id)
     : id_(id),
       rnd_(id+1),
-      heap_size_(0),
-      locks_ok_(0),
-      locks_failed_(0) {
+      heap_size_(0) {
   }
 
   virtual ~TesterThread() {
-    if (FLAGS_verbose)
-      fprintf(LOGSTREAM, "Thread %2d: locks %6d ok; %6d trylocks failed\n",
-              id_, locks_ok_, locks_failed_);
-    if (locks_ok_ + locks_failed_ >= 1000) {
-      CHECK_LE(locks_failed_, locks_ok_ / 2);
-    }
   }
 
   virtual void Run() {
@@ -530,16 +505,13 @@ class TesterThread {
     const int tid = rnd_.Uniform(FLAGS_numthreads);
     TesterThread* thread = threads[tid];
 
-    if (thread->lock_.TryLock()) {
+    if (thread->lock_.try_lock()) {
       // Pass the object
-      locks_ok_++;
       thread->passed_.push_back(object);
-      thread->lock_.Unlock();
+      thread->lock_.unlock();
       heap_size_ -= object.size;
       heap_[index] = heap_[heap_.size()-1];
       heap_.pop_back();
-    } else {
-      locks_failed_++;
     }
   }
 
@@ -550,13 +522,11 @@ class TesterThread {
     // objects into a local vector.
     vector<Object> copy;
     { // Locking scope
-      if (!lock_.TryLock()) {
-        locks_failed_++;
+      if (!lock_.try_lock()) {
         return;
       }
-      locks_ok_++;
       swap(copy, passed_);
-      lock_.Unlock();
+      lock_.unlock();
     }
 
     for (int i = 0; i < copy.size(); ++i) {
@@ -654,7 +624,7 @@ static void TestRealloc() {
   // makes reallocs of small sizes do extra work (thus, failing these
   // checks).  Since sampling is random, we turn off sampling to make
   // sure that doesn't happen to us here.
-  const int64 old_sample_parameter = FLAGS_tcmalloc_sample_parameter;
+  const int64_t old_sample_parameter = FLAGS_tcmalloc_sample_parameter;
   FLAGS_tcmalloc_sample_parameter = 0;   // turn off sampling
 
   int start_sizes[] = { 100, 1000, 10000, 100000 };
@@ -665,12 +635,12 @@ static void TestRealloc() {
     CHECK(p);
     // The larger the start-size, the larger the non-reallocing delta.
     for (int d = 0; d < (s+1) * 2; ++d) {
-      void* new_p = noopt(realloc(p, start_sizes[s] + deltas[d]));
+      void* new_p = noopt(realloc)(p, start_sizes[s] + deltas[d]);
       CHECK(p == new_p);  // realloc should not allocate new memory
     }
     // Test again, but this time reallocing smaller first.
     for (int d = 0; d < s*2; ++d) {
-      void* new_p = noopt(realloc(p, start_sizes[s] - deltas[d]));
+      void* new_p = noopt(realloc)(p, start_sizes[s] - deltas[d]);
       CHECK(p == new_p);  // realloc should not allocate new memory
     }
     free(p);
@@ -678,6 +648,9 @@ static void TestRealloc() {
   FLAGS_tcmalloc_sample_parameter = old_sample_parameter;
 #endif
 }
+
+#if __cpp_exceptions
+static int news_handled = 0;
 
 static void TestNewHandler() {
   ++news_handled;
@@ -772,6 +745,7 @@ static void TestNothrowNew(void* (*func)(size_t, const std::nothrow_t&)) {
   }
   std::set_new_handler(saved_handler);
 }
+#endif  // __cpp_exceptions
 
 
 // These are used as callbacks by the sanity-check.  Set* and Reset*
@@ -801,12 +775,6 @@ static void TestNothrowNew(void* (*func)(size_t, const std::nothrow_t&)) {
 // We do one for each hook typedef in malloc_hook.h
 MAKE_HOOK_CALLBACK(NewHook, const void*, size_t);
 MAKE_HOOK_CALLBACK(DeleteHook, const void*);
-MAKE_HOOK_CALLBACK(MmapHook, const void*, const void*, size_t, int, int, int,
-                   off_t);
-MAKE_HOOK_CALLBACK(MremapHook, const void*, const void*, size_t, size_t, int,
-                   const void*);
-MAKE_HOOK_CALLBACK(MunmapHook, const void *, size_t);
-MAKE_HOOK_CALLBACK(SbrkHook, const void *, ptrdiff_t);
 
 static void TestAlignmentForSize(int size) {
   fprintf(LOGSTREAM, "Testing alignment of malloc(%d)\n", size);
@@ -912,13 +880,13 @@ static void TestRanges() {
 
   CheckRangeCallback(a, base::MallocRange::INUSE, MB);
   CheckRangeCallback(b, base::MallocRange::INUSE, MB);
-  free(a);
+  (noopt(free))(a);
   CheckRangeCallback(a, base::MallocRange::FREE, MB);
   CheckRangeCallback(b, base::MallocRange::INUSE, MB);
   MallocExtension::instance()->ReleaseFreeMemory();
   CheckRangeCallback(a, releasedType, MB);
   CheckRangeCallback(b, base::MallocRange::INUSE, MB);
-  free(b);
+  (noopt(free))(b);
   CheckRangeCallback(a, releasedType, MB);
   CheckRangeCallback(b, base::MallocRange::FREE, MB);
 }
@@ -1144,8 +1112,23 @@ static void check_global_nallocx() { CHECK_GT(nallocx(99, 0), 99); }
 
 #endif // __GNUC__
 
+static size_t GrowNallocxTestSize(size_t sz) {
+  if (sz < 1024) {
+    return sz + 7;
+  }
+
+  size_t divided = sz >> 7;
+  divided |= (divided >> 1);
+  divided |= (divided >> 2);
+  divided |= (divided >> 4);
+  divided |= (divided >> 8);
+  divided |= (divided >> 16);
+  divided += 1;
+  return sz + divided;
+}
+
 static void TestNAllocX() {
-  for (size_t size = 0; size <= (1 << 20); size += 7) {
+  for (size_t size = 0; size <= (1 << 20); size = GrowNallocxTestSize(size)) {
     size_t rounded = nallocx(size, 0);
     ASSERT_GE(rounded, size);
     void* ptr = malloc(size);
@@ -1155,12 +1138,13 @@ static void TestNAllocX() {
 }
 
 static void TestNAllocXAlignment() {
-  for (size_t size = 0; size <= (1 << 20); size += 7) {
-    for (size_t align = 0; align < 10; align++) {
-      size_t rounded = nallocx(size, MALLOCX_LG_ALIGN(align));
+  for (size_t size = 0; size <= (1 << 20); size = GrowNallocxTestSize(size)) {
+    for (size_t align_log = 0; align_log < 10; align_log++) {
+      size_t rounded = nallocx(size, MALLOCX_LG_ALIGN(align_log));
+      size_t align = size_t{1} << align_log;
       ASSERT_GE(rounded, size);
-      ASSERT_EQ(rounded % (1 << align), 0);
-      void* ptr = tc_memalign(1 << align, size);
+      ASSERT_EQ(rounded % align, 0);
+      void* ptr = tc_memalign(align, size);
       ASSERT_EQ(rounded, MallocExtension::instance()->GetAllocatedSize(ptr));
       free(ptr);
     }
@@ -1213,43 +1197,6 @@ static int RunAllTests(int argc, char** argv) {
   TestNewOOMHandling();
 #endif
 
-  // TODO(odo):  This test has been disabled because it is only by luck that it
-  // does not result in fragmentation.  When tcmalloc makes an allocation which
-  // spans previously unused leaves of the pagemap it will allocate and fill in
-  // the leaves to cover the new allocation.  The leaves happen to be 256MiB in
-  // the 64-bit build, and with the sbrk allocator these allocations just
-  // happen to fit in one leaf by luck.  With other allocators (mmap,
-  // memfs_malloc when used with small pages) the allocations generally span
-  // two leaves and this results in a very bad fragmentation pattern with this
-  // code.  The same failure can be forced with the sbrk allocator just by
-  // allocating something on the order of 128MiB prior to starting this test so
-  // that the test allocations straddle a 256MiB boundary.
-
-  // TODO(csilvers): port MemoryUsage() over so the test can use that
-#if 0
-# include <unistd.h>      // for getpid()
-  // Allocate and deallocate blocks of increasing sizes to check if the alloc
-  // metadata fragments the memory. (Do not put other allocations/deallocations
-  // before this test, it may break).
-  {
-    size_t memory_usage = MemoryUsage(getpid());
-    fprintf(LOGSTREAM, "Testing fragmentation\n");
-    for ( int i = 200; i < 240; ++i ) {
-      int size = i << 20;
-      void *test1 = rnd.alloc(size);
-      CHECK(test1);
-      for ( int j = 0; j < size; j += (1 << 12) ) {
-        static_cast<char*>(test1)[j] = 1;
-      }
-      free(test1);
-    }
-    // There may still be a bit of fragmentation at the beginning, until we
-    // reach kPageMapBigAllocationThreshold bytes so we check for
-    // 200 + 240 + margin.
-    CHECK_LT(MemoryUsage(getpid()), memory_usage + (450 << 20) );
-  }
-#endif
-
   // Check that empty allocation works
   fprintf(LOGSTREAM, "Testing empty allocation\n");
   {
@@ -1299,7 +1246,7 @@ static int RunAllTests(int argc, char** argv) {
     SetNewHook();      // defined as part of MAKE_HOOK_CALLBACK, above
     SetDeleteHook();   // ditto
 
-    void* p1 = malloc(10);
+    void* p1 = noopt(malloc)(10);
     CHECK(p1 != NULL);    // force use of this variable
     VerifyNewHookWasCalled();
     // Also test the non-standard tc_malloc_size
@@ -1315,13 +1262,13 @@ static int RunAllTests(int argc, char** argv) {
     free(p1);
     VerifyDeleteHookWasCalled();
 
-    p1 = calloc(10, 2);
+    p1 = noopt(calloc)(10, 2);
     CHECK(p1 != NULL);
     VerifyNewHookWasCalled();
     // We make sure we realloc to a big size, since some systems (OS
     // X) will notice if the realloced size continues to fit into the
     // malloc-block and make this a noop if so.
-    p1 = realloc(p1, 30000);
+    p1 = noopt(realloc)(p1, 30000);
     CHECK(p1 != NULL);
     VerifyNewHookWasCalled();
     VerifyDeleteHookWasCalled();
@@ -1329,13 +1276,13 @@ static int RunAllTests(int argc, char** argv) {
     VerifyDeleteHookWasCalled();
 
     if (kOSSupportsMemalign) {
-      CHECK_EQ(PosixMemalign(&p1, sizeof(p1), 40), 0);
+      CHECK_EQ(noopt(PosixMemalign)(&p1, sizeof(p1), 40), 0);
       CHECK(p1 != NULL);
       VerifyNewHookWasCalled();
       free(p1);
       VerifyDeleteHookWasCalled();
 
-      p1 = Memalign(sizeof(p1) * 2, 50);
+      p1 = noopt(Memalign)(sizeof(p1) * 2, 50);
       CHECK(p1 != NULL);
       VerifyNewHookWasCalled();
       free(p1);
@@ -1344,7 +1291,7 @@ static int RunAllTests(int argc, char** argv) {
 
     // Windows has _aligned_malloc.  Let's test that that's captured too.
 #if (defined(_MSC_VER) || defined(__MINGW32__)) && !defined(PERFTOOLS_NO_ALIGNED_MALLOC)
-    p1 = _aligned_malloc(sizeof(p1) * 2, 64);
+    p1 = noopt(_aligned_malloc)(sizeof(p1) * 2, 64);
     CHECK(p1 != NULL);
     VerifyNewHookWasCalled();
     _aligned_free(p1);
@@ -1415,8 +1362,6 @@ static int RunAllTests(int argc, char** argv) {
     VerifyDeleteHookWasCalled();
 #endif
 
-#if defined(ENABLE_ALIGNED_NEW_DELETE)
-
     overaligned_type* poveraligned = noopt(new overaligned_type);
     CHECK(poveraligned != NULL);
     CHECK((((size_t)poveraligned) % OVERALIGNMENT) == 0u);
@@ -1460,7 +1405,6 @@ static int RunAllTests(int argc, char** argv) {
     ::operator delete(p2, std::align_val_t(OVERALIGNMENT), std::nothrow);
     VerifyDeleteHookWasCalled();
 
-#ifdef ENABLE_SIZED_DELETE
     poveraligned = noopt(new overaligned_type);
     CHECK(poveraligned != NULL);
     CHECK((((size_t)poveraligned) % OVERALIGNMENT) == 0u);
@@ -1474,10 +1418,11 @@ static int RunAllTests(int argc, char** argv) {
     VerifyNewHookWasCalled();
     ::operator delete[](poveraligned, sizeof(overaligned_type) * 10, std::align_val_t(OVERALIGNMENT));
     VerifyDeleteHookWasCalled();
-#endif
 
-#endif // defined(ENABLE_ALIGNED_NEW_DELETE)
-
+// On AIX user defined malloc replacement of libc routines
+// cannot be done at link time must be done a runtime via
+// environment variable MALLOCTYPE
+#if !defined(_AIX)
     // Try strdup(), which the system allocates but we must free.  If
     // all goes well, libc will use our malloc!
     p2 = noopt(strdup("in memory of James Golick"));
@@ -1485,72 +1430,13 @@ static int RunAllTests(int argc, char** argv) {
     VerifyNewHookWasCalled();
     free(p2);
     VerifyDeleteHookWasCalled();
-
-
-    // Test mmap too: both anonymous mmap and mmap of a file
-    // Note that for right now we only override mmap on linux
-    // systems, so those are the only ones for which we check.
-    SetMmapHook();
-    SetMremapHook();
-    SetMunmapHook();
-#if defined(HAVE_MMAP) && defined(__linux) && \
-       (defined(__i386__) || defined(__x86_64__))
-    int size = 8192*2;
-    p1 = mmap(NULL, size, PROT_WRITE|PROT_READ, MAP_ANONYMOUS|MAP_PRIVATE,
-              -1, 0);
-    CHECK(p1 != NULL);
-    VerifyMmapHookWasCalled();
-    p1 = mremap(p1, size, size/2, 0);
-    CHECK(p1 != NULL);
-    VerifyMremapHookWasCalled();
-    size /= 2;
-    munmap(p1, size);
-    VerifyMunmapHookWasCalled();
-
-    int fd = open("/dev/zero", O_RDONLY);
-    CHECK_GE(fd, 0);   // make sure the open succeeded
-    p1 = mmap(NULL, 8192, PROT_READ, MAP_SHARED, fd, 0);
-    CHECK(p1 != NULL);
-    VerifyMmapHookWasCalled();
-    munmap(p1, 8192);
-    VerifyMunmapHookWasCalled();
-    close(fd);
-#else   // this is just to quiet the compiler: make sure all fns are called
-    IncrementCallsToMmapHook(NULL, NULL, 0, 0, 0, 0, 0);
-    IncrementCallsToMunmapHook(NULL, 0);
-    IncrementCallsToMremapHook(NULL, NULL, 0, 0, 0, NULL);
-    VerifyMmapHookWasCalled();
-    VerifyMremapHookWasCalled();
-    VerifyMunmapHookWasCalled();
-#endif
-
-    // Test sbrk
-    SetSbrkHook();
-#if defined(HAVE___SBRK) && defined(__linux) && \
-       (defined(__i386__) || defined(__x86_64__))
-    p1 = sbrk(8192);
-    CHECK(p1 != NULL);
-    VerifySbrkHookWasCalled();
-    p1 = sbrk(-8192);
-    CHECK(p1 != NULL);
-    VerifySbrkHookWasCalled();
-    // However, sbrk hook should *not* be called with sbrk(0)
-    p1 = sbrk(0);
-    CHECK(p1 != NULL);
-    CHECK_EQ(g_SbrkHook_calls, 0);
-#else   // this is just to quiet the compiler: make sure all fns are called
-    IncrementCallsToSbrkHook(NULL, 0);
-    VerifySbrkHookWasCalled();
 #endif
 
     // Reset the hooks to what they used to be.  These are all
     // defined as part of MAKE_HOOK_CALLBACK, above.
     ResetNewHook();
     ResetDeleteHook();
-    ResetMmapHook();
-    ResetMremapHook();
-    ResetMunmapHook();
-    ResetSbrkHook();
+
   }
 
   // Check that "lots" of memory can be allocated
@@ -1589,6 +1475,7 @@ static int RunAllTests(int argc, char** argv) {
   fprintf(LOGSTREAM, "Testing realloc\n");
   TestRealloc();
 
+#if __cpp_exceptions
   fprintf(LOGSTREAM, "Testing operator new(nothrow).\n");
   TestNothrowNew(&::operator new);
   fprintf(LOGSTREAM, "Testing operator new[](nothrow).\n");
@@ -1597,6 +1484,7 @@ static int RunAllTests(int argc, char** argv) {
   TestNew(&::operator new);
   fprintf(LOGSTREAM, "Testing operator new[].\n");
   TestNew(&::operator new[]);
+#endif
 
   // Create threads
   fprintf(LOGSTREAM, "Testing threaded allocation/deallocation (%d threads)\n",
@@ -1607,7 +1495,7 @@ static int RunAllTests(int argc, char** argv) {
   }
 
   // This runs all the tests at the same time, with a 1M stack size each
-  RunManyThreadsWithId(RunThread, FLAGS_numthreads, 1<<20);
+  RunManyThreadsWithId(RunThread, FLAGS_numthreads);
 
   for (int i = 0; i < FLAGS_numthreads; ++i) delete threads[i];    // Cleanup
 
@@ -1675,9 +1563,8 @@ int main(int argc, char** argv) {
   const char* patch;
   char mmp[64];
   const char* human_version = tc_version(&major, &minor, &patch);
-  snprintf(mmp, sizeof(mmp), "%d.%d%s", major, minor, patch);
-  CHECK(!strcmp(PACKAGE_STRING, human_version));
-  CHECK(!strcmp(PACKAGE_VERSION, mmp));
+  snprintf(mmp, sizeof(mmp), "gperftools %d.%d%s", major, minor, patch);
+  CHECK(!strcmp(TC_VERSION_STRING, human_version));
 
   fprintf(LOGSTREAM, "PASS\n");
 }

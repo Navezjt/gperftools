@@ -35,25 +35,15 @@
 // it should not be used when performance is key.
 
 #include "base/low_level_alloc.h"
+
 #include "base/dynamic_annotations.h"
 #include "base/spinlock.h"
 #include "base/logging.h"
+
 #include "malloc_hook-inl.h"
 #include <gperftools/malloc_hook.h>
-#include <errno.h>
-#ifdef HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-#ifdef HAVE_MMAP
-#include <sys/mman.h>
-#endif
-#include <new>                   // for placement-new
 
-// On systems (like freebsd) that don't define MAP_ANONYMOUS, use the old
-// form of the name instead.
-#ifndef MAP_ANONYMOUS
-# define MAP_ANONYMOUS MAP_ANON
-#endif
+#include "mmap_hook.h"
 
 // A first-fit allocator with amortized logarithmic free() time.
 
@@ -63,30 +53,30 @@ LowLevelAlloc::PagesAllocator::~PagesAllocator() {
 // ---------------------------------------------------------------------------
 static const int kMaxLevel = 30;
 
-// We put this class-only struct in a namespace to avoid polluting the
-// global namespace with this struct name (thus risking an ODR violation).
-namespace low_level_alloc_internal {
+namespace {
   // This struct describes one allocated block, or one free block.
   struct AllocList {
+    constexpr AllocList() {}
+
     struct Header {
       intptr_t size;  // size of entire region, including this field. Must be
                       // first.  Valid in both allocated and unallocated blocks
       intptr_t magic; // kMagicAllocated or kMagicUnallocated xor this
       LowLevelAlloc::Arena *arena; // pointer to parent arena
       void *dummy_for_alignment;   // aligns regions to 0 mod 2*sizeof(void*)
-    } header;
+    } header{};
 
     // Next two fields: in unallocated blocks: freelist skiplist data
     //                  in allocated blocks: overlaps with client data
-    int levels;           // levels in skiplist used
-    AllocList *next[kMaxLevel];   // actually has levels elements.
-                                  // The AllocList node may not have room for
-                                  // all kMaxLevel entries.  See max_fit in
-                                  // LLA_SkiplistLevels()
+    int levels{};                   // levels in skiplist used
+    AllocList *next[kMaxLevel]{};   // actually has levels
+                                    // elements.  The AllocList
+                                    // node may not have room for
+                                    // all kMaxLevel entries.  See
+                                    // max_fit in
+                                    // LLA_SkiplistLevels()
   };
-}
-using low_level_alloc_internal::AllocList;
-
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // A trivial skiplist implementation.  This is used to keep the freelist
@@ -107,7 +97,7 @@ static int IntLog2(size_t size, size_t base) {
 
 // Return a random integer n:  p(n)=1/(2**n) if 1 <= n; p(n)=0 if n < 1.
 static int Random() {
-  static uint32 r = 1;         // no locking---it's not critical
+  static uint32_t r = 1;         // no locking---it's not critical
   int result = 1;
   while ((((r = r*1103515245 + 12345) >> 30) & 1) == 0) {
     result++;
@@ -184,21 +174,21 @@ static void LLA_SkiplistDelete(AllocList *head, AllocList *e,
 // Arena implementation
 
 struct LowLevelAlloc::Arena {
-  Arena() : mu(SpinLock::LINKER_INITIALIZED) {} // does nothing; for static init
-  explicit Arena(int) : pagesize(0) {}  // set pagesize to zero explicitly
-                                        // for non-static init
+  constexpr Arena() {}
 
-  SpinLock mu;            // protects freelist, allocation_count,
-                          // pagesize, roundup, min_size
-  AllocList freelist;     // head of free list; sorted by addr (under mu)
-  int32 allocation_count; // count of allocated blocks (under mu)
-  int32 flags;            // flags passed to NewArena (ro after init)
-  size_t pagesize;        // ==getpagesize()  (init under mu, then ro)
-  size_t roundup;         // lowest power of 2 >= max(16,sizeof (AllocList))
-                          // (init under mu, then ro)
-  size_t min_size;        // smallest allocation block size
-                          // (init under mu, then ro)
-  PagesAllocator *allocator;
+  SpinLock mu;                 // protects freelist, allocation_count,
+                               // pagesize, roundup, min_size
+
+  AllocList freelist;         // head of free list; sorted by addr (under mu)
+  int32_t allocation_count{}; // count of allocated blocks (under mu)
+  int32_t flags{};            // flags passed to NewArena (ro after init)
+  size_t pagesize{};          // ==getpagesize()  (init under mu, then ro)
+  size_t roundup{};           // lowest power of 2 >= max(16,sizeof (AllocList))
+                              // (init under mu, then ro)
+  size_t min_size{};          // smallest allocation block size
+                              // (init under mu, then ro)
+  PagesAllocator *allocator{};
+
 };
 
 // The default arena, which is used when 0 is passed instead of an Arena
@@ -216,8 +206,8 @@ namespace {
   class DefaultPagesAllocator : public LowLevelAlloc::PagesAllocator {
   public:
     virtual ~DefaultPagesAllocator() {};
-    virtual void *MapPages(int32 flags, size_t size);
-    virtual void UnMapPages(int32 flags, void *addr, size_t size);
+    virtual void *MapPages(int32_t flags, size_t size);
+    virtual void UnMapPages(int32_t flags, void *addr, size_t size);
   };
 
 }
@@ -308,13 +298,13 @@ static void ArenaInit(LowLevelAlloc::Arena *arena) {
 }
 
 // L < meta_data_arena->mu
-LowLevelAlloc::Arena *LowLevelAlloc::NewArena(int32 flags,
+LowLevelAlloc::Arena *LowLevelAlloc::NewArena(int32_t flags,
                                               Arena *meta_data_arena) {
   return NewArenaWithCustomAlloc(flags, meta_data_arena, NULL);
 }
 
 // L < meta_data_arena->mu
-LowLevelAlloc::Arena *LowLevelAlloc::NewArenaWithCustomAlloc(int32 flags,
+LowLevelAlloc::Arena *LowLevelAlloc::NewArenaWithCustomAlloc(int32_t flags,
                                                              Arena *meta_data_arena,
                                                              PagesAllocator *allocator) {
   RAW_CHECK(meta_data_arena != 0, "must pass a valid arena");
@@ -327,7 +317,7 @@ LowLevelAlloc::Arena *LowLevelAlloc::NewArenaWithCustomAlloc(int32 flags,
   }
   // Arena(0) uses the constructor for non-static contexts
   Arena *result =
-    new (AllocWithArena(sizeof (*result), meta_data_arena)) Arena(0);
+    new (AllocWithArena(sizeof (*result), meta_data_arena)) Arena();
   ArenaInit(result);
   result->flags = flags;
   if (allocator) {
@@ -357,12 +347,8 @@ bool LowLevelAlloc::DeleteArena(Arena *arena) {
                 "empty arena has non-page-aligned block size");
       RAW_CHECK(reinterpret_cast<intptr_t>(region) % arena->pagesize == 0,
                 "empty arena has non-page-aligned block");
-      int munmap_result;
-      if ((arena->flags & LowLevelAlloc::kAsyncSignalSafe) == 0) {
-        munmap_result = munmap(region, size);
-      } else {
-        munmap_result = MallocHook::UnhookedMUnmap(region, size);
-      }
+      int munmap_result = tcmalloc::DirectMUnMap((arena->flags & LowLevelAlloc::kAsyncSignalSafe) == 0,
+                                                 region, size);
       RAW_CHECK(munmap_result == 0,
                 "LowLevelAlloc::DeleteArena:  munmap failed address");
     }
@@ -552,29 +538,20 @@ LowLevelAlloc::PagesAllocator *LowLevelAlloc::GetDefaultPagesAllocator(void) {
   return default_pages_allocator;
 }
 
-void *DefaultPagesAllocator::MapPages(int32 flags, size_t size) {
-  void *new_pages;
-  if ((flags & LowLevelAlloc::kAsyncSignalSafe) != 0) {
-    new_pages = MallocHook::UnhookedMMap(0, size,
-                                         PROT_WRITE|PROT_READ,
-                                         MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
-  } else {
-    new_pages = mmap(0, size,
-                     PROT_WRITE|PROT_READ,
-                     MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
-  }
-  RAW_CHECK(new_pages != MAP_FAILED, "mmap error");
+void *DefaultPagesAllocator::MapPages(int32_t flags, size_t size) {
+  const bool invoke_hooks = ((flags & LowLevelAlloc::kAsyncSignalSafe) == 0);
 
-  return new_pages;
+  auto result = tcmalloc::DirectAnonMMap(invoke_hooks, size);
+
+  RAW_CHECK(result.success, "mmap error");
+
+  return result.addr;
 }
 
-void DefaultPagesAllocator::UnMapPages(int32 flags, void *region, size_t size) {
-  int munmap_result;
-  if ((flags & LowLevelAlloc::kAsyncSignalSafe) == 0) {
-    munmap_result = munmap(region, size);
-  } else {
-    munmap_result = MallocHook::UnhookedMUnmap(region, size);
-  }
+void DefaultPagesAllocator::UnMapPages(int32_t flags, void *region, size_t size) {
+  const bool invoke_hooks = ((flags & LowLevelAlloc::kAsyncSignalSafe) == 0);
+
+  int munmap_result = tcmalloc::DirectMUnMap(invoke_hooks, region, size);
   RAW_CHECK(munmap_result == 0,
             "LowLevelAlloc::DeleteArena: munmap failed address");
 }

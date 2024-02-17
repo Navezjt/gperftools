@@ -30,23 +30,18 @@
 
 // ---
 // Author: Sanjay Ghemawat
-
 #include "config_for_unittests.h"
-#include <stdio.h>
-#include <stdlib.h>
-#if defined HAVE_STDINT_H
-#include <stdint.h>             // to get intptr_t
-#elif defined HAVE_INTTYPES_H
-#include <inttypes.h>           // another place intptr_t might be defined
-#endif
-#include <sys/types.h>
-#include <vector>
-#include "base/logging.h"
+
 #include "pagemap.h"
 
-using std::vector;
+#include <stdio.h>
+#include <stdlib.h>
 
-static void Permute(vector<intptr_t>* elements) {
+#include <vector>
+
+#include "base/logging.h"
+
+static void Permute(std::vector<intptr_t>* elements) {
   if (elements->empty())
     return;
   const size_t num_elements = elements->size();
@@ -98,7 +93,7 @@ void TestMap(int limit, bool limit_is_below_the_overflow_boundary) {
 
   { // Test randomized accesses
     srand(301);   // srand isn't great, but it's portable
-    vector<intptr_t> elements;
+    std::vector<intptr_t> elements;
     for (intptr_t i = 0; i < static_cast<intptr_t>(limit); i++) elements.push_back(i);
     Permute(&elements);
 

@@ -87,7 +87,7 @@ static void Test(bool use_new_arena, bool call_malloc_hook, int n) {
   int rnd;
   LowLevelAlloc::Arena *arena = 0;
   if (use_new_arena) {
-    int32 flags = call_malloc_hook?  LowLevelAlloc::kCallMallocHook :  0;
+    int32_t flags = call_malloc_hook?  LowLevelAlloc::kCallMallocHook :  0;
     arena = LowLevelAlloc::NewArena(flags, LowLevelAlloc::DefaultArena());
   }
   for (int i = 0; i != n; i++) {
@@ -145,8 +145,8 @@ static void Test(bool use_new_arena, bool call_malloc_hook, int n) {
 }
 
 // used for counting allocates and frees
-static int32 allocates;
-static int32 frees;
+static int32_t allocates;
+static int32_t frees;
 
 // called on each alloc if kCallMallocHook specified
 static void AllocHook(const void *p, size_t size) {
@@ -163,8 +163,6 @@ static void FreeHook(const void *p) {
 }
 
 int main(int argc, char *argv[]) {
-  // This is needed by maybe_threads_unittest.sh, which parses argv[0]
-  // to figure out what directory low_level_alloc_unittest is in.
   if (argc != 1) {
     fprintf(stderr, "USAGE: %s\n", argv[0]);
     return 1;
