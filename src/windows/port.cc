@@ -36,8 +36,8 @@
 # error You should only be including windows/port.cc in a windows environment!
 #endif
 
-#define NOMINMAX       // so std::max, below, compiles correctly
-#include <config.h>
+#include "config.h"
+
 #include <string.h>    // for strlen(), memset(), memcmp()
 #include <assert.h>
 #include <stdarg.h>    // for va_list, va_start, va_end
@@ -46,6 +46,7 @@
 #include "port.h"
 #include "base/logging.h"
 #include "base/spinlock.h"
+#include "base/threading.h"
 #include "internal_logging.h"
 
 // -----------------------------------------------------------------------
@@ -83,7 +84,7 @@ extern "C" PERFTOOLS_DLL_DECL void WriteToStderr(const char* buf, int len) {
 // -----------------------------------------------------------------------
 // Threads code
 
-// Windows doesn't support pthread_key_create's destr_function, and in
+// Windows doesn't support tcmalloc::CreateTlsKey's destr_function, and in
 // fact it's a bit tricky to get code to run when a thread exits.  This
 // is cargo-cult magic from https://www.codeproject.com/Articles/8113/Thread-Local-Storage-The-C-Way
 // and http://lallouslab.net/2017/05/30/using-cc-tls-callbacks-in-visual-studio-with-your-32-or-64bits-programs/.
@@ -111,7 +112,7 @@ extern "C" PERFTOOLS_DLL_DECL void WriteToStderr(const char* buf, int len) {
 #endif
 
 // When destr_fn eventually runs, it's supposed to take as its
-// argument the tls-value associated with key that pthread_key_create
+// argument the tls-value associated with key that tcmalloc::CreateTlsKey
 // creates.  (Yeah, it sounds confusing but it's really not.)  We
 // store the destr_fn/key pair in this data structure.  Because we
 // store this in a single var, this implies we can only have one
@@ -120,7 +121,7 @@ extern "C" PERFTOOLS_DLL_DECL void WriteToStderr(const char* buf, int len) {
 // into an array.
 struct DestrFnClosure {
   void (*destr_fn)(void*);
-  pthread_key_t key_for_destr_fn_arg;
+  tcmalloc::TlsKey key_for_destr_fn_arg;
 };
 
 static DestrFnClosure destr_fn_info;   // initted to all NULL/0.
@@ -186,11 +187,11 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD dwReason, PVOID pv) {
 
 #endif  // #ifdef _MSC_VER
 
-extern "C" pthread_key_t PthreadKeyCreate(void (*destr_fn)(void*)) {
+tcmalloc::TlsKey tcmalloc::WinTlsKeyCreate(void (*destr_fn)(void*)) {
   // Semantics are: we create a new key, and then promise to call
   // destr_fn with TlsGetValue(key) when the thread is destroyed
   // (as long as TlsGetValue(key) is not NULL).
-  pthread_key_t key = TlsAlloc();
+  tcmalloc::TlsKey key = TlsAlloc();
   if (destr_fn) {   // register it
     // If this assert fails, we'll need to support an array of destr_fn_infos
     assert(destr_fn_info.destr_fn == NULL);
@@ -199,31 +200,6 @@ extern "C" pthread_key_t PthreadKeyCreate(void (*destr_fn)(void*)) {
   }
   return key;
 }
-
-// NOTE: this is Win2K and later.  For Win98 we could use a CRITICAL_SECTION...
-extern "C" int perftools_pthread_once(pthread_once_t *once_control,
-                                      void (*init_routine)(void)) {
-  // Try for a fast path first. Note: this should be an acquire semantics read.
-  // It is on x86 and x64, where Windows runs.
-  if (*once_control != 1) {
-    while (true) {
-      switch (InterlockedCompareExchange(once_control, 2, 0)) {
-        case 0:
-          init_routine();
-          InterlockedExchange(once_control, 1);
-          return 0;
-        case 1:
-          // The initializer has already been executed
-          return 0;
-        default:
-          // The initializer is being processed by another thread
-          SwitchToThread();
-      }
-    }
-  }
-  return 0;
-}
-
 
 // -----------------------------------------------------------------------
 // These functions rework existing functions of the same name in the

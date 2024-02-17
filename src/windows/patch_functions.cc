@@ -92,6 +92,7 @@
 #include <vector>
 #include <base/logging.h>
 #include "base/spinlock.h"
+#include "getenv_safe.h" // for TCMallocGetenvSafe
 #include "gperftools/malloc_hook.h"
 #include "malloc_hook-inl.h"
 #include "preamble_patcher.h"
@@ -328,10 +329,11 @@ struct ModuleEntryCopy {
       FARPROC target = ::GetProcAddress(
           reinterpret_cast<const HMODULE>(mi.lpBaseOfDll),
           LibcInfo::function_name(i));
+      void* target_addr = reinterpret_cast<void*>(target);
       // Sometimes a DLL forwards a function to a function in another
       // DLL.  We don't want to patch those forwarded functions --
       // they'll get patched when the other DLL is processed.
-      if (target >= modBaseAddr && target < modEndAddr)
+      if (modBaseAddr <= target_addr && target_addr < modEndAddr)
         rgProcAddresses[i] = (GenericFnPtr)target;
       else
         rgProcAddresses[i] = (GenericFnPtr)NULL;
@@ -349,8 +351,7 @@ class WindowsInfo {
   // TODO(csilvers): should we be patching GlobalAlloc/LocalAlloc instead,
   //                 for pre-XP systems?
   enum {
-    kHeapAlloc, kHeapFree, kVirtualAllocEx, kVirtualFreeEx,
-    kMapViewOfFileEx, kUnmapViewOfFile, kLoadLibraryExW, kFreeLibrary,
+    kHeapAlloc, kHeapFree, kLoadLibraryExW, kFreeLibrary,
     kNumFunctions
   };
 
@@ -368,20 +369,6 @@ class WindowsInfo {
                                            DWORD_PTR dwBytes);
   static BOOL WINAPI Perftools_HeapFree(HANDLE hHeap, DWORD dwFlags,
                                         LPVOID lpMem);
-  // A Windows-API equivalent of mmap and munmap, for "anonymous regions"
-  static LPVOID WINAPI Perftools_VirtualAllocEx(HANDLE process, LPVOID address,
-                                                SIZE_T size, DWORD type,
-                                                DWORD protect);
-  static BOOL WINAPI Perftools_VirtualFreeEx(HANDLE process, LPVOID address,
-                                             SIZE_T size, DWORD type);
-  // A Windows-API equivalent of mmap and munmap, for actual files
-  static LPVOID WINAPI Perftools_MapViewOfFileEx(HANDLE hFileMappingObject,
-                                                 DWORD dwDesiredAccess,
-                                                 DWORD dwFileOffsetHigh,
-                                                 DWORD dwFileOffsetLow,
-                                                 SIZE_T dwNumberOfBytesToMap,
-                                                 LPVOID lpBaseAddress);
-  static BOOL WINAPI Perftools_UnmapViewOfFile(LPCVOID lpBaseAddress);
   // We don't need the other 3 variants because they all call this one. */
   static HMODULE WINAPI Perftools_LoadLibraryExW(LPCWSTR lpFileName,
                                                  HANDLE hFile,
@@ -462,6 +449,12 @@ template<int T> GenericFnPtr LibcInfoWithPatchFunctions<T>::origstub_fn_[] = {
   // This will get filled in at run-time, as patching is done.
 };
 
+// _expand() is like realloc but doesn't move the
+// pointer.  We punt, which will cause callers to fall back on realloc.
+static void* empty__expand(void*, size_t) __THROW {
+  return nullptr;
+}
+
 template<int T>
 const GenericFnPtr LibcInfoWithPatchFunctions<T>::perftools_fn_[] = {
   (GenericFnPtr)&Perftools_malloc,
@@ -477,7 +470,7 @@ const GenericFnPtr LibcInfoWithPatchFunctions<T>::perftools_fn_[] = {
   (GenericFnPtr)&Perftools_delete_nothrow,
   (GenericFnPtr)&Perftools_deletearray_nothrow,
   (GenericFnPtr)&Perftools__msize,
-  (GenericFnPtr)&Perftools__expand,
+  (GenericFnPtr)&empty__expand,
   (GenericFnPtr)&Perftools_calloc,
   (GenericFnPtr)&Perftools_free_base,
   (GenericFnPtr)&Perftools_free_dbg
@@ -486,10 +479,6 @@ const GenericFnPtr LibcInfoWithPatchFunctions<T>::perftools_fn_[] = {
 /*static*/ WindowsInfo::FunctionInfo WindowsInfo::function_info_[] = {
   { "HeapAlloc", NULL, NULL, (GenericFnPtr)&Perftools_HeapAlloc },
   { "HeapFree", NULL, NULL, (GenericFnPtr)&Perftools_HeapFree },
-  { "VirtualAllocEx", NULL, NULL, (GenericFnPtr)&Perftools_VirtualAllocEx },
-  { "VirtualFreeEx", NULL, NULL, (GenericFnPtr)&Perftools_VirtualFreeEx },
-  { "MapViewOfFileEx", NULL, NULL, (GenericFnPtr)&Perftools_MapViewOfFileEx },
-  { "UnmapViewOfFile", NULL, NULL, (GenericFnPtr)&Perftools_UnmapViewOfFile },
   { "LoadLibraryExW", NULL, NULL, (GenericFnPtr)&Perftools_LoadLibraryExW },
   { "FreeLibrary", NULL, NULL, (GenericFnPtr)&Perftools_FreeLibrary },
 };
@@ -675,7 +664,7 @@ void PatchMainExecutableLocked() {
 // the call to LoadLibraryExW, resulting in deadlock.  The solution is
 // to be very careful not to call *any* windows routines while holding
 // patch_all_modules_lock, inside PatchAllModules().
-static SpinLock patch_all_modules_lock(SpinLock::LINKER_INITIALIZED);
+static SpinLock patch_all_modules_lock;
 
 // last_loaded: The set of modules that were loaded the last time
 // PatchAllModules was called.  This is an optimization for only
@@ -935,15 +924,6 @@ size_t LibcInfoWithPatchFunctions<T>::Perftools__msize(void* ptr) __THROW {
   return GetSizeWithCallback(ptr, (size_t (*)(const void*))origstub_fn_[k_Msize]);
 }
 
-// We need to define this because internal windows functions like to
-// call into it(?).  _expand() is like realloc but doesn't move the
-// pointer.  We punt, which will cause callers to fall back on realloc.
-template<int T>
-void* LibcInfoWithPatchFunctions<T>::Perftools__expand(void *ptr,
-                                                       size_t size) __THROW {
-  return NULL;
-}
-
 LPVOID WINAPI WindowsInfo::Perftools_HeapAlloc(HANDLE hHeap, DWORD dwFlags,
                                                DWORD_PTR dwBytes) {
   LPVOID result = ((LPVOID (WINAPI *)(HANDLE, DWORD, DWORD_PTR))
@@ -956,50 +936,21 @@ LPVOID WINAPI WindowsInfo::Perftools_HeapAlloc(HANDLE hHeap, DWORD dwFlags,
 BOOL WINAPI WindowsInfo::Perftools_HeapFree(HANDLE hHeap, DWORD dwFlags,
                                             LPVOID lpMem) {
   MallocHook::InvokeDeleteHook(lpMem);
-  return ((BOOL (WINAPI *)(HANDLE, DWORD, LPVOID))
-          function_info_[kHeapFree].origstub_fn)(
-              hHeap, dwFlags, lpMem);
-}
 
-LPVOID WINAPI WindowsInfo::Perftools_VirtualAllocEx(HANDLE process,
-                                                    LPVOID address,
-                                                    SIZE_T size, DWORD type,
-                                                    DWORD protect) {
-  LPVOID result = ((LPVOID (WINAPI *)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD))
-                   function_info_[kVirtualAllocEx].origstub_fn)(
-                       process, address, size, type, protect);
-  // VirtualAllocEx() seems to be the Windows equivalent of mmap()
-  MallocHook::InvokeMmapHook(result, address, size, protect, type, -1, 0);
-  return result;
-}
+  // We perform this check to work around a malloc/HeapFree mismatch
+  // in shell32.dll versions [10.0.22000.0, 10.0.22621.900)
+  // See issue #1490 for more context and oneapi-src/oneTBB #665
+  // for a full breakdown
+  bool owned_by_tcmalloc = MallocExtension::instance()->GetOwnership(lpMem) == MallocExtension::kOwned;
 
-BOOL WINAPI WindowsInfo::Perftools_VirtualFreeEx(HANDLE process, LPVOID address,
-                                                 SIZE_T size, DWORD type) {
-  MallocHook::InvokeMunmapHook(address, size);
-  return ((BOOL (WINAPI *)(HANDLE, LPVOID, SIZE_T, DWORD))
-          function_info_[kVirtualFreeEx].origstub_fn)(
-              process, address, size, type);
-}
-
-LPVOID WINAPI WindowsInfo::Perftools_MapViewOfFileEx(
-    HANDLE hFileMappingObject, DWORD dwDesiredAccess, DWORD dwFileOffsetHigh,
-    DWORD dwFileOffsetLow, SIZE_T dwNumberOfBytesToMap, LPVOID lpBaseAddress) {
-  // For this function pair, you always deallocate the full block of
-  // data that you allocate, so NewHook/DeleteHook is the right API.
-  LPVOID result = ((LPVOID (WINAPI *)(HANDLE, DWORD, DWORD, DWORD,
-                                      SIZE_T, LPVOID))
-                   function_info_[kMapViewOfFileEx].origstub_fn)(
-                       hFileMappingObject, dwDesiredAccess, dwFileOffsetHigh,
-                       dwFileOffsetLow, dwNumberOfBytesToMap, lpBaseAddress);
-  MallocHook::InvokeNewHook(result, dwNumberOfBytesToMap);
-  return result;
-}
-
-BOOL WINAPI WindowsInfo::Perftools_UnmapViewOfFile(LPCVOID lpBaseAddress) {
-  MallocHook::InvokeDeleteHook(lpBaseAddress);
-  return ((BOOL (WINAPI *)(LPCVOID))
-          function_info_[kUnmapViewOfFile].origstub_fn)(
-              lpBaseAddress);
+  if (!owned_by_tcmalloc) {
+    return ((BOOL (WINAPI *)(HANDLE, DWORD, LPVOID))
+            function_info_[kHeapFree].origstub_fn)(
+                hHeap, dwFlags, lpMem);
+  } else {
+    do_free(lpMem);
+    return true;
+  }
 }
 
 HMODULE WINAPI WindowsInfo::Perftools_LoadLibraryExW(LPCWSTR lpFileName,
@@ -1055,9 +1006,16 @@ BOOL WINAPI WindowsInfo::Perftools_FreeLibrary(HMODULE hLibModule) {
 // ---------------------------------------------------------------------
 
 void PatchWindowsFunctions() {
-  // This does the libc patching in every module, and the main executable.
-  PatchAllModules();
-  main_executable_windows.Patch();
+  const char* disable_env = TCMallocGetenvSafe("TCMALLOC_DISABLE_REPLACEMENT");
+  const bool should_skip = disable_env &&
+                           disable_env[0] == '1' &&
+                           disable_env[1] == '\0';
+
+  if (!should_skip) {
+    // This does the libc patching in every module, and the main executable.
+    PatchAllModules();
+    main_executable_windows.Patch();
+  }
 }
 
 #if 0

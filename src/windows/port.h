@@ -41,11 +41,9 @@
 #ifndef GOOGLE_BASE_WINDOWS_H_
 #define GOOGLE_BASE_WINDOWS_H_
 
-/* You should never include this file directly, but always include it
-   from either config.h (MSVC) or mingw.h (MinGW/msys). */
-#if !defined(GOOGLE_PERFTOOLS_WINDOWS_CONFIG_H_) && \
-    !defined(GOOGLE_PERFTOOLS_WINDOWS_MINGW_H_)
-# error "port.h should only be included from config.h or mingw.h"
+/* You should never include this file directly, but always include it from config.h */
+#ifndef GPERFTOOLS_CONFIG_H_
+# error "port.h should only be included from config.h"
 #endif
 
 #ifdef _WIN32
@@ -53,6 +51,29 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN  /* We always want minimal includes */
 #endif
+
+// windows.h whatevevs defines min and max preprocessor macros and
+// that breaks ::max() in various places (like numeric_limits)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+// This must be defined before the windows.h is included.  We need at
+// least 0x0400 for mutex.h to have access to TryLock, and at least
+// 0x0501 for patch_functions.cc to have access to GetModuleHandleEx.
+// (This latter is an optimization we could take out if need be.)
+#ifndef _WIN32_WINNT
+# define _WIN32_WINNT 0x0501
+#endif
+
+// We want to make sure not to ever try to #include heap-checker.h
+#define NO_HEAP_CHECK 1
+
+#if defined(__MINGW32__) && __MSVCRT_VERSION__ < 0x0700
+// Older version of the mingw msvcrt don't define _aligned_malloc
+# define PERFTOOLS_NO_ALIGNED_MALLOC 1
+#endif
+
 #include <windows.h>
 #include <io.h>              /* because we so often use open/close/etc */
 #include <direct.h>          /* for _getcwd */
@@ -101,10 +122,6 @@
 
 /* ----------------------------------- BASIC TYPES */
 
-#ifndef HAVE_STDINT_H
-# error  Do not know how to set up type aliases.  Edit port.h for your system.
-#endif
-
 /* I guess MSVC's <types.h> doesn't include ssize_t by default? */
 #ifdef _MSC_VER
 typedef intptr_t ssize_t;
@@ -112,149 +129,12 @@ typedef intptr_t ssize_t;
 
 /* ----------------------------------- THREADS */
 
-#ifndef HAVE_PTHREAD   /* not true for MSVC, but may be true for MSYS */
-typedef DWORD pthread_t;
-typedef DWORD pthread_key_t;
-typedef LONG pthread_once_t;
-enum { PTHREAD_ONCE_INIT = 0 };   /* important that this be 0! for SpinLock */
-
-inline pthread_t pthread_self(void) {
-  return GetCurrentThreadId();
-}
-
-#ifdef __cplusplus
-inline bool pthread_equal(pthread_t left, pthread_t right) {
-  return left == right;
-}
-
-/*
- * windows/port.h defines compatibility APIs for several .h files, which
- * we therefore shouldn't be #including directly.  This hack keeps us from
- * doing so.  TODO(csilvers): do something more principled.
- */
-#define GOOGLE_MAYBE_THREADS_H_ 1
-/* This replaces maybe_threads.{h,cc} */
-
-EXTERN_C pthread_key_t PthreadKeyCreate(void (*destr_fn)(void*));  /* port.cc */
-
-inline int perftools_pthread_key_create(pthread_key_t *pkey,
-                                        void (*destructor)(void*)) {
-  pthread_key_t key = PthreadKeyCreate(destructor);
-  if (key != TLS_OUT_OF_INDEXES) {
-    *(pkey) = key;
-    return 0;
-  } else {
-    return GetLastError();
-  }
-}
-
-inline void* perftools_pthread_getspecific(DWORD key) {
-  DWORD err = GetLastError();
-  void* rv = TlsGetValue(key);
-  if (err) SetLastError(err);
-  return rv;
-}
-
-inline int perftools_pthread_setspecific(pthread_key_t key, const void *value) {
-  if (TlsSetValue(key, (LPVOID)value))
-    return 0;
-  else
-    return GetLastError();
-}
-
-EXTERN_C int perftools_pthread_once(pthread_once_t *once_control,
-                                    void (*init_routine)(void));
-
-#endif  /* __cplusplus */
-
-inline void sched_yield(void) {
-  Sleep(0);
-}
-
-#endif  /* HAVE_PTHREAD */
-
 /*
  * __declspec(thread) isn't usable in a dll opened via LoadLibrary().
  * But it doesn't work to LoadLibrary() us anyway, because of all the
  * things we need to do before main()!  So this kind of TLS is safe for us.
  */
 #define __thread __declspec(thread)
-
-/*
- * This code is obsolete, but I keep it around in case we are ever in
- * an environment where we can't or don't want to use google spinlocks
- * (from base/spinlock.{h,cc}).  In that case, uncommenting this out,
- * and removing spinlock.cc from the build, should be enough to revert
- * back to using native spinlocks.
- */
-#if 0
-// Windows uses a spinlock internally for its mutexes, making our life easy!
-// However, the Windows spinlock must always be initialized, making life hard,
-// since we want LINKER_INITIALIZED.  We work around this by having the
-// linker initialize a bool to 0, and check that before accessing the mutex.
-// This replaces spinlock.{h,cc}, and all the stuff it depends on (atomicops)
-#ifdef __cplusplus
-class SpinLock {
- public:
-  SpinLock() : initialize_token_(PTHREAD_ONCE_INIT) {}
-  // Used for global SpinLock vars (see base/spinlock.h for more details).
-  enum StaticInitializer { LINKER_INITIALIZED };
-  explicit SpinLock(StaticInitializer) : initialize_token_(PTHREAD_ONCE_INIT) {
-    perftools_pthread_once(&initialize_token_, InitializeMutex);
-  }
-
-  // It's important SpinLock not have a destructor: otherwise we run
-  // into problems when the main thread has exited, but other threads
-  // are still running and try to access a main-thread spinlock.  This
-  // means we leak mutex_ (we should call DeleteCriticalSection()
-  // here).  However, I've verified that all SpinLocks used in
-  // perftools have program-long scope anyway, so the leak is
-  // perfectly fine.  But be aware of this for the future!
-
-  void Lock() {
-    // You'd thionk this would be unnecessary, since we call
-    // InitializeMutex() in our constructor.  But sometimes Lock() can
-    // be called before our constructor is!  This can only happen in
-    // global constructors, when this is a global.  If we live in
-    // bar.cc, and some global constructor in foo.cc calls a routine
-    // in bar.cc that calls this->Lock(), then Lock() may well run
-    // before our global constructor does.  To protect against that,
-    // we do this check.  For SpinLock objects created after main()
-    // has started, this pthread_once call will always be a noop.
-    perftools_pthread_once(&initialize_token_, InitializeMutex);
-    EnterCriticalSection(&mutex_);
-  }
-  void Unlock() {
-    LeaveCriticalSection(&mutex_);
-  }
-
-  // Used in assertion checks: assert(lock.IsHeld()) (see base/spinlock.h).
-  inline bool IsHeld() const {
-    // This works, but probes undocumented internals, so I've commented it out.
-    // c.f. http://msdn.microsoft.com/msdnmag/issues/03/12/CriticalSections/
-    //return mutex_.LockCount>=0 && mutex_.OwningThread==GetCurrentThreadId();
-    return true;
-  }
- private:
-  void InitializeMutex() { InitializeCriticalSection(&mutex_); }
-
-  pthread_once_t initialize_token_;
-  CRITICAL_SECTION mutex_;
-};
-
-class SpinLockHolder {  // Acquires a spinlock for as long as the scope lasts
- private:
-  SpinLock* lock_;
- public:
-  inline explicit SpinLockHolder(SpinLock* l) : lock_(l) { l->Lock(); }
-  inline ~SpinLockHolder() { lock_->Unlock(); }
-};
-#endif  // #ifdef __cplusplus
-
-// This keeps us from using base/spinlock.h's implementation of SpinLock.
-#define BASE_SPINLOCK_H_ 1
-
-#endif  /* #if 0 */
 
 /* ----------------------------------- MMAP and other memory allocation */
 
@@ -294,44 +174,6 @@ inline void *sbrk(intptr_t increment) {
   return (void*)-1;
 }
 
-
-/* ----------------------------------- STRING ROUTINES */
-
-/*
- * We can't just use _vsnprintf and _snprintf as drop-in-replacements,
- * because they don't always NUL-terminate. :-(  We also can't use the
- * name vsnprintf, since windows defines that (but not snprintf (!)).
- */
-#if defined(_MSC_VER) && _MSC_VER >= 1400
-/* We can use safe CRT functions, which the required functionality */
-inline int perftools_vsnprintf(char *str, size_t size, const char *format,
-                               va_list ap) {
-  return vsnprintf_s(str, size, _TRUNCATE, format, ap);
-}
-#else
-inline int perftools_vsnprintf(char *str, size_t size, const char *format,
-                               va_list ap) {
-  if (size == 0)        /* not even room for a \0? */
-    return -1;        /* not what C99 says to do, but what windows does */
-  str[size-1] = '\0';
-  return _vsnprintf(str, size-1, format, ap);
-}
-#endif
-
-#ifndef HAVE_INTTYPES_H
-#define PRIx64  "I64x"
-#define SCNx64  "I64x"
-#define PRId64  "I64d"
-#define SCNd64  "I64d"
-#define PRIu64  "I64u"
-#ifdef _WIN64
-# define PRIuPTR "llu"
-# define PRIxPTR "llx"
-#else
-# define PRIuPTR "lu"
-# define PRIxPTR "lx"
-#endif
-#endif
 
 /* ----------------------------------- FILE IO */
 
@@ -383,15 +225,6 @@ inline int pclose(FILE *stream) {
 EXTERN_C PERFTOOLS_DLL_DECL void WriteToStderr(const char* buf, int len);
 
 /* ----------------------------------- SYSTEM/PROCESS */
-
-#ifndef HAVE_PID_T
-typedef int pid_t;
-#endif
-
-#if __STDC__ && !defined(__MINGW32__)
-inline pid_t getpid(void) { return _getpid(); }
-#endif
-inline pid_t getppid(void) { return 0; }
 
 /* Handle case when poll is used to simulate sleep. */
 inline int poll(struct pollfd* fds, int nfds, int timeout) {
